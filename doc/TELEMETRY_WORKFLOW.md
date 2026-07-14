@@ -42,8 +42,8 @@ name line:
 ```
 
 `<issue>` is the public Paperclip issue or PR identifier that explains the
-product work, for example `PAP-2450` or
-`https://github.com/paperclipai/paperclip/issues/2450`. `<rationale>` should say
+product work, for example
+`https://github.com/paperclipai/paperclip/issues/2450` or `PAP-2450`. `<rationale>` should say
 what product or reliability decision this event will inform. It is source-review
 context, not telemetry payload.
 
@@ -51,7 +51,7 @@ Use this copy-pasteable multi-line shape:
 
 ```ts
 client.track(
-  // @ts-expect-error -- proposed-telemetry(PAP-2450): measure Skill Studio create completion
+  // @ts-expect-error -- proposed-telemetry(https://github.com/paperclipai/paperclip/issues/2450): measure Skill Studio create completion
   "skill_studio.skill_created",
   {
     sharing_scope: scope,
