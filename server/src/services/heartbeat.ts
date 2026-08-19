@@ -150,6 +150,8 @@ import {
   WORKTREE_INSTANCE_ROOT_METADATA_KEY,
 } from "./workspace-instance-cleanup.js";
 import { issueService } from "./issues.js";
+import { recordProviderDeliveryAttestation } from "./provider-delivery-attestation.js";
+import { computeTargetFingerprint } from "./workspace-target-fingerprint.js";
 import { projectService } from "./projects.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { createToolGatewayService } from "./tool-gateway.js";
@@ -15644,6 +15646,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // rather than silently leaving dependents stranded behind a missing
         // finalize row.
         await recordWorkspaceFinalize("succeeded");
+        if (issueRef?.completionRequirement === "workspace_delivery" && issueRef.projectWorkspaceId) {
+          const targetLocator = resolvedWorkspace.repoUrl ?? executionWorkspace.cwd;
+          await recordProviderDeliveryAttestation({
+            db, companyId: agent.companyId, issueId: issueRef.id, runId: run.id,
+            declarationId: `projectWorkspace:${issueRef.projectWorkspaceId}`,
+            declarationRevision: issueContext?.completionRequirementRevision ?? 0,
+            targetFingerprint: computeTargetFingerprint(agent.companyId, "git", targetLocator),
+            cwd: executionWorkspace.cwd, repoUrl: resolvedWorkspace.repoUrl,
+            repoRef: executionWorkspace.branchName ?? resolvedWorkspace.repoRef,
+          });
+        }
       } catch (adapterErr) {
         // Adapter (or its restore finally) threw — or the finalize record
         // write itself threw. Either way the workspace may be in a partial

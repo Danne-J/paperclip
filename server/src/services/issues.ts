@@ -7142,6 +7142,16 @@ export function issueService(db: Db) {
         }
         if (projectWorkspaceId) {
           await assertValidProjectWorkspace(companyId, issueData.projectId, projectWorkspaceId, tx);
+          if (issueData.completionRequirement === undefined) {
+            const workspace = await tx
+              .select({ defaultCompletionRequirement: projectWorkspaces.defaultCompletionRequirement })
+              .from(projectWorkspaces)
+              .where(and(eq(projectWorkspaces.companyId, companyId), eq(projectWorkspaces.id, projectWorkspaceId)))
+              .then((rows) => rows[0] ?? null);
+            if (workspace?.defaultCompletionRequirement != null) {
+              issueData.completionRequirement = workspace.defaultCompletionRequirement;
+            }
+          }
         }
         if (executionWorkspaceId) {
           await assertValidExecutionWorkspace(companyId, issueData.projectId, executionWorkspaceId, tx);

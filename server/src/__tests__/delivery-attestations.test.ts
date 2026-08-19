@@ -1,4 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   agents,
@@ -15,6 +19,7 @@ import {
 import { deliveryAttestationService } from "../services/delivery-attestations.js";
 import { issueService } from "../services/issues.js";
 import { computeTargetFingerprint } from "../services/workspace-target-fingerprint.js";
+import { inspectGitDelivery, recordProviderDeliveryAttestation } from "../services/provider-delivery-attestation.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -98,6 +103,89 @@ describeEmbeddedPostgres("delivery attestations", () => {
     });
     return issueId;
   }
+
+  describe("provider Git inspection", () => {
+    const testGit = "/usr/bin/git";
+    function git(cwd: string, ...args: string[]) {
+      execFileSync(testGit, ["-C", cwd, ...args], {
+        stdio: "ignore",
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: "Test",
+          GIT_AUTHOR_EMAIL: "test@example.invalid",
+          GIT_COMMITTER_NAME: "Test",
+          GIT_COMMITTER_EMAIL: "test@example.invalid",
+        },
+      });
+    }
+
+    function makeDeliveredRepo() {
+      const root = mkdtempSync(join(tmpdir(), "paperclip-delivery-attestation-"));
+      const repo = join(root, "repo");
+      const remote = join(root, "remote.git");
+      execFileSync(testGit, ["init", "--bare", remote], { stdio: "ignore" });
+      execFileSync(testGit, ["init", repo], { stdio: "ignore" });
+      git(repo, "config", "user.email", "test@example.invalid");
+      git(repo, "config", "user.name", "Test");
+      git(repo, "config", "commit.gpgsign", "false");
+      git(repo, "config", "core.hooksPath", "/dev/null");
+      execFileSync(testGit, ["-C", repo, "branch", "-M", "main"], { stdio: "ignore" });
+      git(repo, "commit", "--allow-empty", "-m", "delivery");
+      git(repo, "remote", "add", "origin", remote);
+      git(repo, "push", "-u", "origin", "main");
+      return { root, repo, remote };
+    }
+
+    it("records a server-inspected push against the matching run and issue", async () => {
+      const { root, repo, remote } = makeDeliveredRepo();
+      try {
+        const runId = await makeRun();
+        const issueId = await makeIssue({ completionRequirement: "workspace_delivery" });
+        const { attestation, inspection } = await recordProviderDeliveryAttestation({
+          db,
+          companyId,
+          issueId,
+          runId,
+          declarationId: `projectWorkspace:${issueId}`,
+          declarationRevision: 0,
+          targetFingerprint: computeTargetFingerprint(companyId, "git", remote),
+          cwd: repo,
+          repoUrl: remote,
+          repoRef: "main",
+        });
+        expect(inspection).toMatchObject({ outcome: "succeeded", deliveryMethod: "push", workspaceDirty: false });
+        expect(attestation).toMatchObject({ companyId, issueId, runId, outcome: "succeeded", deliveryMethod: "push" });
+        expect(attestation.providerSignature).toBeTruthy();
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("records a failed attestation when the provider remote does not contain the checkout revision", async () => {
+      const { root, repo, remote } = makeDeliveredRepo();
+      try {
+        git(repo, "commit", "--allow-empty", "-m", "undelivered");
+        const runId = await makeRun();
+        const issueId = await makeIssue({ completionRequirement: "workspace_delivery" });
+        const { attestation, inspection } = await recordProviderDeliveryAttestation({
+          db,
+          companyId,
+          issueId,
+          runId,
+          declarationId: `projectWorkspace:${issueId}`,
+          declarationRevision: 0,
+          targetFingerprint: computeTargetFingerprint(companyId, "git", remote),
+          cwd: repo,
+          repoUrl: remote,
+          repoRef: "main",
+        });
+        expect(inspection).toMatchObject({ outcome: "failed", deliveryMethod: "none" });
+        expect(attestation).toMatchObject({ companyId, issueId, runId, outcome: "failed", deliveryMethod: "none" });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  });
 
   describe("deliveryAttestationService", () => {
     it("is append-only: a repeated call for the same operation key does not create a duplicate row", async () => {
