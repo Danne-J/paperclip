@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, statSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -265,11 +265,19 @@ function runVitest(args, label) {
   };
   mkdirSync(env.PAPERCLIP_HOME, { recursive: true });
   mkdirSync(env.TMPDIR, { recursive: true });
-  const result = spawnSync("pnpm", ["exec", "vitest", "run", ...args], {
-    cwd: repoRoot,
-    env,
-    stdio: "inherit",
-  });
+  let result;
+  try {
+    result = spawnSync("pnpm", ["exec", "vitest", "run", ...args], {
+      cwd: repoRoot,
+      env,
+      stdio: "inherit",
+    });
+  } finally {
+    // Vitest invocations get their own scratch dir per call (many per full
+    // run); leaving these behind is what fills /tmp on long-lived hosts, so
+    // clean up here regardless of pass/fail/crash.
+    rmSync(testRoot, { recursive: true, force: true });
+  }
   if (result.error) {
     console.error(`[test:run] Failed to start Vitest: ${result.error.message}`);
     process.exit(1);
