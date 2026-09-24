@@ -679,6 +679,106 @@ describe("agent permission routes", () => {
     ]);
   });
 
+  it("exposes only heartbeat runtime config to a fleet heartbeat holder", async () => {
+    mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+      allowed: input.action === "agent:read",
+      reason: input.action === "agent:read" ? "allow_test_read" : "deny_missing_grant",
+      explanation: input.action === "agent:read" ? "Allowed by test read grant." : "Missing test grant.",
+    }));
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      permissions: { canManageFleetHeartbeat: true },
+    });
+    mockAgentService.list.mockResolvedValue([{
+      ...baseAgent,
+      adapterConfig: { secret: "redact-me" },
+      runtimeConfig: {
+        heartbeat: { enabled: true, intervalSec: 60 },
+        internal: "redact-me",
+      },
+    }]);
+
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      runId: "run-1",
+      source: "agent_key",
+    });
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/companies/${companyId}/agents`));
+
+    expect(res.status).toBe(200);
+    expect(res.body[0].adapterConfig).toEqual({});
+    expect(res.body[0].runtimeConfig).toEqual({ heartbeat: { enabled: true, intervalSec: 60 } });
+  });
+
+  it("allows a holder to patch heartbeat keys and audits before/after values", async () => {
+    const existing = {
+      ...baseAgent,
+      permissions: { canManageFleetHeartbeat: true },
+      runtimeConfig: { heartbeat: { enabled: true, intervalSec: 60 }, internal: "redact-me" },
+    };
+    mockAgentService.getById.mockResolvedValue(existing);
+    mockAgentService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...existing,
+      runtimeConfig: patch.runtimeConfig,
+    }));
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      runId: "run-1",
+      source: "agent_key",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}`)
+      .send({ runtimeConfig: { heartbeat: { intervalSec: 120 } } }));
+
+    expect(res.status).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalledWith(
+      agentId,
+      expect.objectContaining({
+        runtimeConfig: {
+          heartbeat: { enabled: true, intervalSec: 120 },
+          internal: "redact-me",
+        },
+      }),
+      expect.anything(),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "agent.heartbeat_policy_updated",
+      agentId,
+      runId: "run-1",
+      details: expect.objectContaining({
+        before: { enabled: true, intervalSec: 60 },
+        after: { enabled: true, intervalSec: 120 },
+      }),
+    }));
+  });
+
+  it("rejects out-of-scope writes from a fleet heartbeat holder", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      permissions: { canManageFleetHeartbeat: true },
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      runId: "run-1",
+      source: "agent_key",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}`)
+      .send({ runtimeConfig: { heartbeat: { enabled: true }, internal: "nope" } }));
+
+    expect(res.status).toBe(403);
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
   it("blocks agent updates for authenticated company members without agent admin permission", async () => {
     mockAccessService.canUser.mockResolvedValue(false);
 

@@ -100,6 +100,12 @@ describe("agent permissions service", () => {
     expect(agentPermissionsSchema.parse({ canCreateAgents: true }).canCreateAgents).toBe(true);
   });
 
+  it("defaults fleet heartbeat management off and preserves an explicit grant", () => {
+    expect(defaultPermissionsForRole("general").canManageFleetHeartbeat).toBe(false);
+    expect(normalizeAgentPermissions({}, "general").canManageFleetHeartbeat).toBe(false);
+    expect(normalizeAgentPermissions({ canManageFleetHeartbeat: true }, "general").canManageFleetHeartbeat).toBe(true);
+  });
+
   it("validates skill creation permission with a default-on value", () => {
     expect(agentPermissionsSchema.parse({ canCreateAgents: false }).canCreateSkills).toBe(true);
     expect(agentPermissionsSchema.parse({ canCreateAgents: false, canCreateSkills: false }).canCreateSkills).toBe(false);
@@ -112,5 +118,10 @@ describe("agent permissions service", () => {
       canCreateSkills: false,
       canAssignTasks: false,
     }).canCreateSkills).toBe(false);
+    expect(updateAgentPermissionsSchema.parse({
+      canCreateAgents: false,
+      canAssignTasks: false,
+      canManageFleetHeartbeat: true,
+    }).canManageFleetHeartbeat).toBe(true);
   });
 });

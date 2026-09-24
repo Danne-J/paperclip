@@ -266,6 +266,14 @@ import { managedAgentProfileService } from "../services/managed-agent-profiles.j
 import { remoteAgentProfileService } from "../services/remote-agent-profiles.js";
 
 const AGENT_SKILL_ASSIGNMENT_MODES = ["add", "remove", "replace"] as const;
+const FLEET_HEARTBEAT_KEYS = new Set([
+  "enabled",
+  "intervalSec",
+  "cooldownSec",
+  "wakeOnDemand",
+  "maxConcurrentRuns",
+  "skipTimerWhenNoActionableWork",
+]);
 
 function requireAgentSkillAssignmentMode(req: Request, _res: Response, next: NextFunction) {
   if (!AGENT_SKILL_ASSIGNMENT_MODES.includes(req.body?.mode)) {
@@ -2055,6 +2063,24 @@ export function agentRoutes(
     return decision.allowed;
   }
 
+  async function actorCanManageFleetHeartbeat(req: Request, companyId: string) {
+    if (req.actor.type !== "agent" || !req.actor.agentId) return false;
+    const actorAgent = await svc.getById(req.actor.agentId);
+    return actorAgent?.companyId === companyId && Boolean(actorAgent.permissions?.canManageFleetHeartbeat);
+  }
+
+  async function assertCanSetFleetHeartbeatPermission(req: Request, companyId: string, permissions: unknown) {
+    if (!asRecord(permissions)?.canManageFleetHeartbeat) return;
+    if (req.actor.type === "board") {
+      assertCompanyAccess(req, companyId);
+      return;
+    }
+    const actorAgent = req.actor.agentId ? await svc.getById(req.actor.agentId) : null;
+    if (!actorAgent || actorAgent.companyId !== companyId || actorAgent.role !== "ceo") {
+      throw forbidden("Only board or CEO can grant fleet heartbeat permission");
+    }
+  }
+
   async function buildSkippedWakeupResponse(
     agent: NonNullable<Awaited<ReturnType<typeof svc.getById>>>,
     payload: Record<string, unknown> | null | undefined,
@@ -3186,12 +3212,22 @@ export function agentRoutes(
     };
   }
 
-  function redactForRestrictedAgentView(agent: Awaited<ReturnType<typeof svc.getById>>) {
+  function redactForRestrictedAgentView(
+    agent: Awaited<ReturnType<typeof svc.getById>>,
+    options?: { heartbeatOnly?: boolean },
+  ) {
     if (!agent) return null;
     return {
       ...agent,
       adapterConfig: {},
-      runtimeConfig: {},
+      runtimeConfig: options?.heartbeatOnly
+        ? {
+            heartbeat:
+              typeof agent.runtimeConfig?.heartbeat === "object" && agent.runtimeConfig.heartbeat !== null
+                ? agent.runtimeConfig.heartbeat
+                : {},
+          }
+        : {},
     };
   }
 
@@ -3210,7 +3246,10 @@ export function agentRoutes(
     };
   }
 
-  function redactAgentConfiguration(agent: Awaited<ReturnType<typeof svc.getById>>) {
+  function redactAgentConfiguration(
+    agent: Awaited<ReturnType<typeof svc.getById>>,
+    options?: { heartbeatOnly?: boolean },
+  ) {
     if (!agent) return null;
     return {
       id: agent.id,
@@ -3221,8 +3260,15 @@ export function agentRoutes(
       status: agent.status,
       reportsTo: agent.reportsTo,
       adapterType: agent.adapterType,
-      adapterConfig: redactAgentAdapterConfig(agent.adapterConfig),
-      runtimeConfig: redactEventPayload(agent.runtimeConfig),
+      adapterConfig: options?.heartbeatOnly ? {} : redactAgentAdapterConfig(agent.adapterConfig),
+      runtimeConfig: options?.heartbeatOnly
+        ? {
+            heartbeat:
+              typeof agent.runtimeConfig?.heartbeat === "object" && agent.runtimeConfig.heartbeat !== null
+                ? agent.runtimeConfig.heartbeat
+                : {},
+          }
+        : redactEventPayload(agent.runtimeConfig),
       permissions: agent.permissions,
       updatedAt: agent.updatedAt,
     };
@@ -4177,7 +4223,8 @@ export function agentRoutes(
       res.json(result.map((agent) => redactAgentRowForResponse(agent)));
       return;
     }
-    res.json(result.map((agent) => redactForRestrictedAgentView(agent)));
+    const heartbeatOnly = await actorCanManageFleetHeartbeat(req, companyId);
+    res.json(result.map((agent) => redactForRestrictedAgentView(agent, { heartbeatOnly })));
   });
 
   router.get("/instance/scheduler-heartbeats", async (req, res) => {
@@ -4414,7 +4461,12 @@ export function agentRoutes(
       ? true
       : await actorCanReadConfigurationsForCompany(req, agent.companyId);
     if (!canReadSensitiveDetail) {
-      res.json(await buildAgentDetail(agent, { restricted: true }));
+      res.json({
+        ...(await buildAgentDetail(agent, { restricted: true })),
+        ...(await actorCanManageFleetHeartbeat(req, agent.companyId)
+          ? redactForRestrictedAgentView(agent, { heartbeatOnly: true })
+          : {}),
+      });
       return;
     }
     res.json(await buildAgentDetail(agent));
@@ -4427,8 +4479,9 @@ export function agentRoutes(
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-    await assertCanReadConfigurations(req, agent.companyId);
-    res.json(redactAgentConfiguration(agent));
+    const heartbeatOnly = await actorCanManageFleetHeartbeat(req, agent.companyId);
+    if (!heartbeatOnly) await assertCanReadConfigurations(req, agent.companyId);
+    res.json(heartbeatOnly ? redactAgentConfiguration(agent, { heartbeatOnly: true }) : redactAgentConfiguration(agent));
   });
 
   router.get("/agents/:id/config-revisions", async (req, res) => {
@@ -4603,6 +4656,7 @@ export function agentRoutes(
   router.post("/companies/:companyId/agent-hires", validate(createAgentHireSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     await assertCanCreateAgentsForCompany(req, companyId);
+    await assertCanSetFleetHeartbeatPermission(req, companyId, req.body.permissions);
     const sourceIssueIds = parseSourceIssueIds(req.body);
     const {
       desiredSkills: requestedDesiredSkills,
@@ -4926,6 +4980,7 @@ export function agentRoutes(
   router.post("/companies/:companyId/agents", validate(createAgentSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     await assertCanCreateAgentsForCompany(req, companyId);
+    await assertCanSetFleetHeartbeatPermission(req, companyId, req.body.permissions);
 
     const company = await db
       .select()
@@ -5147,6 +5202,7 @@ export function agentRoutes(
       details: {
         canCreateAgents: agent.permissions?.canCreateAgents ?? false,
         canCreateSkills: agent.permissions?.canCreateSkills ?? true,
+        canManageFleetHeartbeat: agent.permissions?.canManageFleetHeartbeat ?? false,
         canAssignTasks: effectiveCanAssignTasks,
         trustPreset: agent.permissions?.trustPreset ?? "standard",
       },
@@ -5562,6 +5618,38 @@ export function agentRoutes(
     }
 
     const patchData = { ...(req.body as Record<string, unknown>) };
+    const actorCanManageHeartbeat = await actorCanManageFleetHeartbeat(req, existing.companyId);
+    const requestedRuntimeConfigInput = hasOwn(patchData, "runtimeConfig")
+      ? asRecord(patchData.runtimeConfig)
+      : null;
+    const heartbeatOnlyPatch = req.actor.type === "agent" && actorCanManageHeartbeat;
+    let heartbeatBefore: Record<string, unknown> | null = null;
+    let heartbeatAfter: Record<string, unknown> | null = null;
+    if (heartbeatOnlyPatch) {
+      const nonRuntimeKeys = Object.keys(patchData).filter((key) => key !== "runtimeConfig");
+      const requestedHeartbeat = requestedRuntimeConfigInput?.heartbeat;
+      const heartbeatRecord = asRecord(requestedHeartbeat);
+      const invalidKeys = requestedRuntimeConfigInput
+        ? Object.keys(requestedRuntimeConfigInput).filter((key) => key !== "heartbeat")
+        : [];
+      const invalidHeartbeatKeys = heartbeatRecord
+        ? Object.keys(heartbeatRecord).filter((key) => !FLEET_HEARTBEAT_KEYS.has(key))
+        : [];
+      if (
+        nonRuntimeKeys.length > 0 ||
+        !requestedRuntimeConfigInput ||
+        !heartbeatRecord ||
+        invalidKeys.length > 0 ||
+        invalidHeartbeatKeys.length > 0
+      ) {
+        res.status(403).json({ error: "Fleet heartbeat permission only allows runtimeConfig.heartbeat policy keys" });
+        return;
+      }
+      const currentRuntime = asRecord(existing.runtimeConfig) ?? {};
+      heartbeatBefore = asRecord(currentRuntime.heartbeat) ?? {};
+      heartbeatAfter = { ...heartbeatBefore, ...heartbeatRecord };
+      patchData.runtimeConfig = { ...currentRuntime, heartbeat: heartbeatAfter };
+    }
     const replaceAdapterConfig = patchData.replaceAdapterConfig === true;
     delete patchData.replaceAdapterConfig;
     // The apply-existing flag is not an agent column. The server binds the fixed
@@ -5701,6 +5789,10 @@ export function agentRoutes(
         adapterConfig: patchData.adapterConfig,
       });
     }
+    if (heartbeatOnlyPatch && requestedRuntimeConfig) {
+      requestedRuntimeConfig = { ...requestedRuntimeConfig };
+      delete requestedRuntimeConfig.aiConnection;
+    }
     if (existing.runtimeConfig.aiConnection && requestedRuntimeConfig && !requestedRuntimeConfig.aiConnection) requestedRuntimeConfig.aiConnection = existing.runtimeConfig.aiConnection;
     const nextAiBinding = aiRuntimeConnectionBindingSchema.safeParse(requestedRuntimeConfig?.aiConnection ?? existing.runtimeConfig.aiConnection).data;
     if (nextAiBinding) {
@@ -5709,8 +5801,8 @@ export function agentRoutes(
       const aiConfig = (patchData.adapterConfig ?? existing.adapterConfig) as Record<string, unknown>;
       if (nextAiBinding.mode !== "router" && !isAiConnectionCompatible(nextAiBinding, requestedAdapterType, aiConfig.model, aiConfig.provider, aiConfig.acpxAgent)) throw unprocessable("Select an AI connection compatible with the new harness and model");
       if (changed || (nextAiBinding.mode === "router" && requestedAdapterType !== existing.adapterType)) await validateManagedAgentBinding(req, existing.companyId, existing.id, requestedAdapterType, aiConfig, nextAiBinding, (patchData.defaultEnvironmentId !== undefined ? patchData.defaultEnvironmentId : existing.defaultEnvironmentId) as string | null, true);
+(feat: scope fleet heartbeat agent permission)
     }
-    if (requestedRuntimeConfig) patchData.runtimeConfig = requestedRuntimeConfig;
     if (touchesAdapterConfiguration || Object.prototype.hasOwnProperty.call(patchData, "defaultEnvironmentId")) {
       await assertAgentDefaultEnvironmentSelection(
         existing.companyId,
@@ -5727,7 +5819,11 @@ export function agentRoutes(
     const profileOnlyChange = touchesProfileFields && Object.keys(patchData).every((key) =>
       (AGENT_PROFILE_CHANGE_CONSENT_FIELDS as readonly string[]).includes(key),
     );
-    if (profileOnlyChange) {
+    if (heartbeatOnlyPatch) {
+      // The scoped heartbeat branch above already validated the actor, company,
+      // and exact writable key set. It deliberately bypasses broad agent config
+      // authorization so this capability cannot be used to mutate other config.
+    } else if (profileOnlyChange) {
       await assertCanApplyAgentProfileChange(req, existing);
     } else {
       await assertCanUpdateAgent(req, existing);
@@ -5760,10 +5856,16 @@ export function agentRoutes(
       agentId: actor.agentId,
       runId: actor.runId,
       agentApiKeyId: actor.agentApiKeyId,
-      action: "agent.updated",
+      action: heartbeatOnlyPatch ? "agent.heartbeat_policy_updated" : "agent.updated",
       entityType: "agent",
       entityId: agent.id,
-      details: summarizeAgentUpdateDetails(patchData),
+      details: heartbeatOnlyPatch
+        ? {
+            changedRuntimeConfigKeys: ["heartbeat"],
+            before: heartbeatBefore,
+            after: heartbeatAfter,
+          }
+        : summarizeAgentUpdateDetails(patchData),
     });
 
     res.json(redactAgentRowForResponse(agent));
