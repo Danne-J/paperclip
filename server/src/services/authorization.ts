@@ -73,6 +73,8 @@ export type AuthorizationAction =
   | "agent_config:read"
   | "agent_config:update"
   | "agent_instructions:update"
+  | "agent_heartbeat:read"
+  | "agent_heartbeat:write"
   | "skill_config:update"
   | "agent:read"
   | "agent:wake"
@@ -159,7 +161,14 @@ function companyIdForResource(resource: AuthorizationResource) {
 }
 
 function permissionForAction(action: AuthorizationAction): PermissionKey | null {
-  if (action === "agent_config:read" || action === "agent_config:update" || action === "agent_instructions:update" || action === "skill_config:update") {
+  if (
+    action === "agent_config:read" ||
+    action === "agent_config:update" ||
+    action === "agent_instructions:update" ||
+    action === "agent_heartbeat:read" ||
+    action === "agent_heartbeat:write" ||
+    action === "skill_config:update"
+  ) {
     return null;
   }
   if (
@@ -549,6 +558,12 @@ function activeResponsibleUserCanAuthorizeAgentGrantedSkillChange(
 
 function scopeBoolean(scope: Record<string, unknown> | null | undefined, key: string) {
   return scope?.[key] === true;
+}
+
+function heartbeatGrantScopeAllows(scope: Record<string, unknown> | null | undefined, operation: "read" | "write") {
+  if (!scope || scope.path !== "runtimeConfig.heartbeat") return false;
+  return Array.isArray(scope.operations) && scope.operations.length === 2 && scope.operations.includes(operation)
+    && scope.operations.includes(operation === "read" ? "write" : "read");
 }
 
 export function authorizationDeniedDetails(decision: AuthorizationDecision) {
@@ -1916,6 +1931,38 @@ export function authorizationService(db: Db | DbTransaction) {
         reason: "deny_company_boundary",
         explanation: "Actor agent was not found in the target company.",
       });
+    }
+
+    if (input.action === "agent_heartbeat:read" || input.action === "agent_heartbeat:write") {
+      const operation = input.action === "agent_heartbeat:read" ? "read" : "write";
+      if (
+        input.resource.type !== "agent" ||
+        !input.resource.agentId ||
+        input.scope?.path !== "runtimeConfig.heartbeat" ||
+        input.scope?.operation !== operation
+      ) {
+        return deny({
+          action: input.action,
+          reason: "deny_scope",
+          explanation: "Fleet heartbeat permission is limited to runtimeConfig.heartbeat.",
+        });
+      }
+      const grantDecision = await decidePrincipalGrant({
+        companyId,
+        principalType: "agent",
+        principalId: actorAgentId,
+        action: input.action,
+        permissionKey: "agents:manage_fleet_heartbeat",
+        scope: input.scope ?? null,
+      });
+      if (!grantDecision.allowed || !heartbeatGrantScopeAllows(grantDecision.grant?.scope, operation)) {
+        return deny({
+          action: input.action,
+          reason: grantDecision.reason === "deny_missing_membership" ? grantDecision.reason : "deny_missing_grant",
+          explanation: "Fleet heartbeat grant does not cover this operation or scope.",
+        });
+      }
+      return grantDecision;
     }
 
     if (input.actor.keyScope?.kind === "skill_test") {

@@ -275,6 +275,15 @@ const FLEET_HEARTBEAT_KEYS = new Set([
   "skipTimerWhenNoActionableWork",
 ]);
 
+function fleetHeartbeatDiff(
+  before: Record<string, unknown>,
+  after: Record<string, unknown>,
+) {
+  return Object.fromEntries(Array.from(FLEET_HEARTBEAT_KEYS)
+    .filter((key) => JSON.stringify(before[key]) !== JSON.stringify(after[key]))
+    .map((key) => [key, { before: before[key] ?? null, after: after[key] ?? null }]));
+}
+
 function requireAgentSkillAssignmentMode(req: Request, _res: Response, next: NextFunction) {
   if (!AGENT_SKILL_ASSIGNMENT_MODES.includes(req.body?.mode)) {
     throw unprocessable(
@@ -2063,22 +2072,20 @@ export function agentRoutes(
     return decision.allowed;
   }
 
-  async function actorCanManageFleetHeartbeat(req: Request, companyId: string) {
+  async function actorCanManageFleetHeartbeat(
+    req: Request,
+    companyId: string,
+    targetAgentId: string,
+    operation: "read" | "write",
+  ) {
     if (req.actor.type !== "agent" || !req.actor.agentId) return false;
-    const actorAgent = await svc.getById(req.actor.agentId);
-    return actorAgent?.companyId === companyId && Boolean(actorAgent.permissions?.canManageFleetHeartbeat);
-  }
-
-  async function assertCanSetFleetHeartbeatPermission(req: Request, companyId: string, permissions: unknown) {
-    if (!asRecord(permissions)?.canManageFleetHeartbeat) return;
-    if (req.actor.type === "board") {
-      assertCompanyAccess(req, companyId);
-      return;
-    }
-    const actorAgent = req.actor.agentId ? await svc.getById(req.actor.agentId) : null;
-    if (!actorAgent || actorAgent.companyId !== companyId || actorAgent.role !== "ceo") {
-      throw forbidden("Only board or CEO can grant fleet heartbeat permission");
-    }
+    const decision = await access.decide({
+      actor: req.actor,
+      action: operation === "read" ? "agent_heartbeat:read" : "agent_heartbeat:write",
+      resource: { type: "agent", companyId, agentId: targetAgentId },
+      scope: { path: "runtimeConfig.heartbeat", operation },
+    });
+    return decision.allowed;
   }
 
   async function buildSkippedWakeupResponse(
@@ -4223,8 +4230,11 @@ export function agentRoutes(
       res.json(result.map((agent) => redactAgentRowForResponse(agent)));
       return;
     }
-    const heartbeatOnly = await actorCanManageFleetHeartbeat(req, companyId);
-    res.json(result.map((agent) => redactForRestrictedAgentView(agent, { heartbeatOnly })));
+    const scopedResult = await Promise.all(result.map(async (agent) => ({
+      agent,
+      heartbeatOnly: await actorCanManageFleetHeartbeat(req, companyId, String(agent.id), "read"),
+    })));
+    res.json(scopedResult.map(({ agent, heartbeatOnly }) => redactForRestrictedAgentView(agent, { heartbeatOnly })));
   });
 
   router.get("/instance/scheduler-heartbeats", async (req, res) => {
@@ -4463,7 +4473,7 @@ export function agentRoutes(
     if (!canReadSensitiveDetail) {
       res.json({
         ...(await buildAgentDetail(agent, { restricted: true })),
-        ...(await actorCanManageFleetHeartbeat(req, agent.companyId)
+        ...(await actorCanManageFleetHeartbeat(req, agent.companyId, agent.id, "read")
           ? redactForRestrictedAgentView(agent, { heartbeatOnly: true })
           : {}),
       });
@@ -4479,7 +4489,7 @@ export function agentRoutes(
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-    const heartbeatOnly = await actorCanManageFleetHeartbeat(req, agent.companyId);
+    const heartbeatOnly = await actorCanManageFleetHeartbeat(req, agent.companyId, agent.id, "read");
     if (!heartbeatOnly) await assertCanReadConfigurations(req, agent.companyId);
     res.json(heartbeatOnly ? redactAgentConfiguration(agent, { heartbeatOnly: true }) : redactAgentConfiguration(agent));
   });
@@ -4656,7 +4666,6 @@ export function agentRoutes(
   router.post("/companies/:companyId/agent-hires", validate(createAgentHireSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     await assertCanCreateAgentsForCompany(req, companyId);
-    await assertCanSetFleetHeartbeatPermission(req, companyId, req.body.permissions);
     const sourceIssueIds = parseSourceIssueIds(req.body);
     const {
       desiredSkills: requestedDesiredSkills,
@@ -4980,7 +4989,6 @@ export function agentRoutes(
   router.post("/companies/:companyId/agents", validate(createAgentSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     await assertCanCreateAgentsForCompany(req, companyId);
-    await assertCanSetFleetHeartbeatPermission(req, companyId, req.body.permissions);
 
     const company = await db
       .select()
@@ -5202,13 +5210,58 @@ export function agentRoutes(
       details: {
         canCreateAgents: agent.permissions?.canCreateAgents ?? false,
         canCreateSkills: agent.permissions?.canCreateSkills ?? true,
-        canManageFleetHeartbeat: agent.permissions?.canManageFleetHeartbeat ?? false,
         canAssignTasks: effectiveCanAssignTasks,
         trustPreset: agent.permissions?.trustPreset ?? "standard",
       },
     });
 
     res.json(await buildAgentDetail(agent));
+  });
+
+  async function assertFleetHeartbeatGrantAuthority(req: Request, target: { id: string; companyId: string }) {
+    assertCompanyAccess(req, target.companyId);
+    if (req.actor.type === "board") {
+      await assertBoardCanManageAgentsForCompany(req, target.companyId);
+      return;
+    }
+    if (req.actor.agentId === target.id) {
+      throw forbidden("Agents cannot grant or revoke their own fleet heartbeat permission");
+    }
+    const actorAgent = req.actor.agentId ? await svc.getById(req.actor.agentId) : null;
+    if (!actorAgent || actorAgent.companyId !== target.companyId || actorAgent.role !== "ceo") {
+      throw forbidden("Only board or CEO can grant or revoke fleet heartbeat permission");
+    }
+  }
+
+  router.put("/agents/:id/fleet-heartbeat-permission", async (req, res) => {
+    const target = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Agent not found");
+    if (!target) return;
+    await assertFleetHeartbeatGrantAuthority(req, target);
+    await access.setPrincipalPermission(
+      target.companyId,
+      "agent",
+      target.id,
+      "agents:manage_fleet_heartbeat",
+      true,
+      req.actor.type === "board" ? (req.actor.userId ?? null) : null,
+      { path: "runtimeConfig.heartbeat", operations: ["read", "write"] },
+    );
+    res.json({ permissionKey: "agents:manage_fleet_heartbeat", agentId: target.id, revoked: false });
+  });
+
+  router.delete("/agents/:id/fleet-heartbeat-permission", async (req, res) => {
+    const target = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Agent not found");
+    if (!target) return;
+    await assertFleetHeartbeatGrantAuthority(req, target);
+    await access.setPrincipalPermission(
+      target.companyId,
+      "agent",
+      target.id,
+      "agents:manage_fleet_heartbeat",
+      false,
+      req.actor.type === "board" ? (req.actor.userId ?? null) : null,
+    );
+    res.json({ permissionKey: "agents:manage_fleet_heartbeat", agentId: target.id, revoked: true });
   });
 
   router.patch("/agents/:id/instructions-path", validate(updateAgentInstructionsPathSchema), async (req, res) => {
@@ -5618,7 +5671,7 @@ export function agentRoutes(
     }
 
     const patchData = { ...(req.body as Record<string, unknown>) };
-    const actorCanManageHeartbeat = await actorCanManageFleetHeartbeat(req, existing.companyId);
+    const actorCanManageHeartbeat = await actorCanManageFleetHeartbeat(req, existing.companyId, existing.id, "write");
     const requestedRuntimeConfigInput = hasOwn(patchData, "runtimeConfig")
       ? asRecord(patchData.runtimeConfig)
       : null;
@@ -5843,12 +5896,35 @@ export function agentRoutes(
         applyExistingWithoutClaim:
           req.actor.type !== "agent" && applyStoredClaudeLogin,
       },
+      ...(heartbeatOnlyPatch ? {
+        afterUpdate: async (txDb) => {
+          await logActivity(txDb, {
+            companyId: existing.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+            action: "agent.heartbeat_policy_updated",
+            entityType: "agent",
+            entityId: existing.id,
+            details: {
+              changedRuntimeConfigKeys: ["heartbeat"],
+              changes: fleetHeartbeatDiff(heartbeatBefore ?? {}, heartbeatAfter ?? {}),
+            },
+          });
+        },
+      } : {}),
     });
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
       return;
     }
 
+    if (heartbeatOnlyPatch) {
+      res.json(agent);
+      return;
+    }
     await logActivity(db, {
       companyId: agent.companyId,
       actorType: actor.actorType,
@@ -5856,16 +5932,10 @@ export function agentRoutes(
       agentId: actor.agentId,
       runId: actor.runId,
       agentApiKeyId: actor.agentApiKeyId,
-      action: heartbeatOnlyPatch ? "agent.heartbeat_policy_updated" : "agent.updated",
+      action: "agent.updated",
       entityType: "agent",
       entityId: agent.id,
-      details: heartbeatOnlyPatch
-        ? {
-            changedRuntimeConfigKeys: ["heartbeat"],
-            before: heartbeatBefore,
-            after: heartbeatAfter,
-          }
-        : summarizeAgentUpdateDetails(patchData),
+      details: summarizeAgentUpdateDetails(patchData),
     });
 
     res.json(redactAgentRowForResponse(agent));

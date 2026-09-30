@@ -357,7 +357,9 @@ describe("agent permission routes", () => {
     mockBuiltInAgentService.ensureCompanyDefaultAgentGrants.mockResolvedValue(0);
     mockAccessService.canUser.mockResolvedValue(true);
     mockAccessService.decide.mockImplementation(async (input: { action?: string }) => {
-      const allowed = Boolean(await mockAccessService.canUser());
+      const allowed = input.action === "agent_heartbeat:read" || input.action === "agent_heartbeat:write"
+        ? false
+        : Boolean(await mockAccessService.canUser());
       return {
         allowed,
         reason: allowed ? "allow_explicit_grant" : "deny_missing_grant",
@@ -681,13 +683,12 @@ describe("agent permission routes", () => {
 
   it("exposes only heartbeat runtime config to a fleet heartbeat holder", async () => {
     mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
-      allowed: input.action === "agent:read",
-      reason: input.action === "agent:read" ? "allow_test_read" : "deny_missing_grant",
-      explanation: input.action === "agent:read" ? "Allowed by test read grant." : "Missing test grant.",
+      allowed: input.action === "agent:read" || input.action === "agent_heartbeat:read",
+      reason: input.action === "agent:read" || input.action === "agent_heartbeat:read" ? "allow_test_read" : "deny_missing_grant",
+      explanation: "Test policy decision",
     }));
     mockAgentService.getById.mockResolvedValue({
       ...baseAgent,
-      permissions: { canManageFleetHeartbeat: true },
     });
     mockAgentService.list.mockResolvedValue([{
       ...baseAgent,
@@ -712,17 +713,55 @@ describe("agent permission routes", () => {
     expect(res.body[0].runtimeConfig).toEqual({ heartbeat: { enabled: true, intervalSec: 60 } });
   });
 
+  it("returns only heartbeat config on agent detail for a holder and an empty config for a non-holder", async () => {
+    const peerAgentId = "44444444-4444-4444-8444-444444444444";
+    const configuredAgent = {
+      ...baseAgent,
+      id: peerAgentId,
+      adapterConfig: { token: "must-not-leak" },
+      runtimeConfig: { heartbeat: { enabled: true, intervalSec: 60 }, internal: "must-not-leak" },
+    };
+    mockAgentService.getById.mockImplementation(async (id: string) => ({ ...configuredAgent, id }));
+    mockAccessService.canUser.mockResolvedValue(false);
+    mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+      allowed: input.action === "agent:read" || input.action === "agent_heartbeat:read",
+      reason: input.action === "agent:read" || input.action === "agent_heartbeat:read" ? "allow_test_read" : "deny_missing_grant",
+      explanation: "Test policy decision",
+    }));
+
+    const holderApp = await createApp({ type: "agent", agentId, companyId, runId: "run-1", source: "agent_key" });
+    const holderResponse = await requestApp(holderApp, (baseUrl) => request(baseUrl).get(`/api/agents/${peerAgentId}`));
+    expect(holderResponse.status).toBe(200);
+    expect(holderResponse.body.adapterConfig).toEqual({});
+    expect(holderResponse.body.runtimeConfig).toEqual({ heartbeat: { enabled: true, intervalSec: 60 } });
+
+    mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+      allowed: input.action === "agent:read",
+      reason: input.action === "agent:read" ? "allow_test_read" : "deny_missing_grant",
+      explanation: "Test policy decision",
+    }));
+    const nonHolderApp = await createApp({ type: "agent", agentId, companyId, runId: "run-2", source: "agent_key" });
+    const nonHolderResponse = await requestApp(nonHolderApp, (baseUrl) => request(baseUrl).get(`/api/agents/${peerAgentId}`));
+    expect(nonHolderResponse.status).toBe(200);
+    expect(nonHolderResponse.body.adapterConfig).toEqual({});
+    expect(nonHolderResponse.body.runtimeConfig).toEqual({});
+  });
+
   it("allows a holder to patch heartbeat keys and audits before/after values", async () => {
     const existing = {
       ...baseAgent,
-      permissions: { canManageFleetHeartbeat: true },
-      runtimeConfig: { heartbeat: { enabled: true, intervalSec: 60 }, internal: "redact-me" },
+      runtimeConfig: { heartbeat: { enabled: true, intervalSec: 60, wakeOnDemand: true }, internal: "redact-me" },
     };
     mockAgentService.getById.mockResolvedValue(existing);
-    mockAgentService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
-      ...existing,
-      runtimeConfig: patch.runtimeConfig,
+    mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+      allowed: input.action === "agent_heartbeat:write",
+      reason: input.action === "agent_heartbeat:write" ? "allow_test_grant" : "deny_missing_grant",
+      explanation: "Test policy decision",
     }));
+    mockAgentService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>, options: { afterUpdate?: (db: unknown) => Promise<void> }) => {
+      await options?.afterUpdate?.({});
+      return { ...existing, runtimeConfig: patch.runtimeConfig };
+    });
     const app = await createApp({
       type: "agent",
       agentId,
@@ -740,7 +779,7 @@ describe("agent permission routes", () => {
       agentId,
       expect.objectContaining({
         runtimeConfig: {
-          heartbeat: { enabled: true, intervalSec: 120 },
+          heartbeat: { enabled: true, intervalSec: 120, wakeOnDemand: true },
           internal: "redact-me",
         },
       }),
@@ -748,19 +787,25 @@ describe("agent permission routes", () => {
     );
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: "agent.heartbeat_policy_updated",
+      actorType: "agent",
       agentId,
       runId: "run-1",
+      entityType: "agent",
+      entityId: agentId,
       details: expect.objectContaining({
-        before: { enabled: true, intervalSec: 60 },
-        after: { enabled: true, intervalSec: 120 },
+        changes: { intervalSec: { before: 60, after: 120 } },
       }),
     }));
   });
 
   it("rejects out-of-scope writes from a fleet heartbeat holder", async () => {
+    mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+      allowed: input.action === "agent_heartbeat:write",
+      reason: input.action === "agent_heartbeat:write" ? "allow_test_grant" : "deny_missing_grant",
+      explanation: "Test policy decision",
+    }));
     mockAgentService.getById.mockResolvedValue({
       ...baseAgent,
-      permissions: { canManageFleetHeartbeat: true },
     });
     const app = await createApp({
       type: "agent",
@@ -770,13 +815,86 @@ describe("agent permission routes", () => {
       source: "agent_key",
     });
 
-    const res = await requestApp(app, (baseUrl) => request(baseUrl)
-      .patch(`/api/agents/${agentId}`)
-      .send({ runtimeConfig: { heartbeat: { enabled: true }, internal: "nope" } }));
-
-    expect(res.status).toBe(403);
+    const invalidPatches = [
+      { runtimeConfig: { heartbeat: { enabled: true }, internal: "nope" } },
+      { runtimeConfig: { heartbeat: { enabled: true }, secrets: { token: "nope" } } },
+      { adapterConfig: { token: "nope" } },
+      { title: "No profile writes" },
+    ];
+    for (const patch of invalidPatches) {
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send(patch));
+      expect(res.status).toBe(403);
+    }
     expect(mockAgentService.update).not.toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("prevents holders from granting their own or another agent's heartbeat permission", async () => {
+    mockAgentService.getById.mockImplementation(async (id: string) => ({ ...baseAgent, id }));
+    const app = await createApp({ type: "agent", agentId, companyId, runId: "run-1", source: "agent_key" });
+
+    const selfGrant = await requestApp(app, (baseUrl) => request(baseUrl)
+      .put(`/api/agents/${agentId}/fleet-heartbeat-permission`));
+    const otherGrant = await requestApp(app, (baseUrl) => request(baseUrl)
+      .put("/api/agents/33333333-3333-4333-8333-333333333333/fleet-heartbeat-permission"));
+
+    expect(selfGrant.status).toBe(403);
+    expect(otherGrant.status).toBe(403);
+    expect(mockAccessService.setPrincipalPermission).not.toHaveBeenCalled();
+  });
+
+  it("allows only CEO agents to grant the capability to a different agent", async () => {
+    const peerAgentId = "33333333-3333-4333-8333-333333333333";
+    mockAgentService.getById.mockImplementation(async (id: string) => ({
+      ...baseAgent,
+      id,
+      role: id === agentId ? "ceo" : "engineer",
+    }));
+    const app = await createApp({ type: "agent", agentId, companyId, runId: "run-1", source: "agent_key" });
+
+    const response = await requestApp(app, (baseUrl) => request(baseUrl)
+      .put(`/api/agents/${peerAgentId}/fleet-heartbeat-permission`));
+
+    expect(response.status).toBe(200);
+    expect(mockAccessService.setPrincipalPermission).toHaveBeenCalledWith(
+      companyId,
+      "agent",
+      peerAgentId,
+      "agents:manage_fleet_heartbeat",
+      true,
+      null,
+      { path: "runtimeConfig.heartbeat", operations: ["read", "write"] },
+    );
+  });
+
+  it("revokes the fleet heartbeat capability through one grant-row delete operation", async () => {
+    const app = await createApp({ type: "board", userId: "board-user", source: "session", isInstanceAdmin: true, companyIds: [companyId] });
+    const response = await requestApp(app, (baseUrl) => request(baseUrl)
+      .delete(`/api/agents/${agentId}/fleet-heartbeat-permission`));
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ permissionKey: "agents:manage_fleet_heartbeat", agentId, revoked: true });
+    expect(mockAccessService.setPrincipalPermission).toHaveBeenCalledTimes(1);
+    expect(mockAccessService.setPrincipalPermission).toHaveBeenCalledWith(
+      companyId, "agent", agentId, "agents:manage_fleet_heartbeat", false, "board-user",
+    );
+  });
+
+  it("does not let heartbeat permission authorize wakeups", async () => {
+    mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+      allowed: input.action === "agent_heartbeat:read",
+      reason: input.action?.startsWith("agent_heartbeat:") ? "allow_test_grant" : "deny_missing_grant",
+      explanation: "Test policy decision",
+    }));
+    mockAgentService.getById.mockImplementation(async (id: string) => ({ ...baseAgent, id: id === agentId ? agentId : "33333333-3333-4333-8333-333333333333" }));
+    const app = await createApp({ type: "agent", agentId, companyId, runId: "run-1", source: "agent_key" });
+    const response = await requestApp(app, (baseUrl) => request(baseUrl).post("/api/agents/33333333-3333-4333-8333-333333333333/wakeup").send({}));
+
+    expect(response.status).toBe(403);
+    expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
   });
 
   it("blocks agent updates for authenticated company members without agent admin permission", async () => {
@@ -2337,17 +2455,17 @@ describe("agent permission routes", () => {
         }
         return null;
       });
-      mockAccessService.decide.mockResolvedValue({
-        allowed: true,
-        reason: "allow_explicit_grant",
-        explanation: "Allowed by explicit grant agents:suggest-changes.",
-        grant: {
+      mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+        allowed: input.action === "agent_config:read",
+        reason: input.action === "agent_config:read" ? "allow_explicit_grant" : "deny_missing_grant",
+        explanation: "Test policy decision",
+        ...(input.action === "agent_config:read" ? { grant: {
           principalType: "agent",
           principalId: agentId,
           permissionKey: "agents:suggest-changes",
           scope: null,
-        },
-      });
+        } } : {}),
+      }));
 
       const app = await createApp({
         type: "agent",

@@ -2069,6 +2069,84 @@ describeEmbeddedPostgres("authorization service", () => {
     expect(denied.explanation).toContain("does not cover the requested scope");
   });
 
+  it("hard-binds fleet heartbeat grants to the heartbeat subtree and company", async () => {
+    const company = await createCompany(db, "FleetHeartbeat");
+    const otherCompany = await createCompany(db, "FleetHeartbeatOther");
+    const holder = await createAgent(db, company.id);
+    const target = await createAgent(db, company.id);
+    const foreignTarget = await createAgent(db, otherCompany.id);
+    await grantAgentPermission(db, company.id, holder.id, "agents:manage_fleet_heartbeat", {
+      path: "runtimeConfig.heartbeat",
+      operations: ["read", "write"],
+    });
+
+    const decide = (action: "agent_heartbeat:read" | "agent_heartbeat:write", targetCompanyId: string, targetAgentId: string, path = "runtimeConfig.heartbeat") =>
+      authorizationService(db).decide({
+        actor: { type: "agent", agentId: holder.id, companyId: company.id, source: "agent_jwt" },
+        action,
+        resource: { type: "agent", companyId: targetCompanyId, agentId: targetAgentId },
+        scope: { path, operation: action.endsWith("read") ? "read" : "write" },
+      });
+
+    await expect(decide("agent_heartbeat:read", company.id, target.id)).resolves.toMatchObject({ allowed: true });
+    await expect(decide("agent_heartbeat:write", company.id, target.id)).resolves.toMatchObject({ allowed: true });
+    for (const path of [
+      "runtimeConfig.secrets",
+      "runtimeConfig.adapterConfig",
+      "runtimeConfig.internal",
+      "adapterConfig",
+      "secrets",
+    ]) {
+      for (const action of ["agent_heartbeat:read", "agent_heartbeat:write"] as const) {
+        await expect(decide(action, company.id, target.id, path))
+          .resolves.toMatchObject({ allowed: false, reason: "deny_scope" });
+      }
+    }
+    await expect(decide("agent_heartbeat:read", otherCompany.id, foreignTarget.id))
+      .resolves.toMatchObject({ allowed: false, reason: "deny_company_boundary" });
+
+    const nonHolder = await createAgent(db, company.id);
+    await expect(
+      authorizationService(db).decide({
+        actor: { type: "agent", agentId: nonHolder.id, companyId: company.id, source: "agent_jwt" },
+        action: "agent_heartbeat:read",
+        resource: { type: "agent", companyId: company.id, agentId: target.id },
+        scope: { path: "runtimeConfig.heartbeat", operation: "read" },
+      }),
+    ).resolves.toMatchObject({ allowed: false });
+
+    await db.delete(principalPermissionGrants).where(
+      and(
+        eq(principalPermissionGrants.companyId, company.id),
+        eq(principalPermissionGrants.principalId, holder.id),
+        eq(principalPermissionGrants.permissionKey, "agents:manage_fleet_heartbeat"),
+      ),
+    );
+    await expect(decide("agent_heartbeat:read", company.id, target.id))
+      .resolves.toMatchObject({ allowed: false });
+  });
+
+  it("does not let a heartbeat grant authorize general config, secrets, or wake actions", async () => {
+    const company = await createCompany(db, "HeartbeatCapabilityBoundary");
+    const holder = await createAgent(db, company.id);
+    const target = await createAgent(db, company.id);
+    await grantAgentPermission(db, company.id, holder.id, "agents:manage_fleet_heartbeat", {
+      path: "runtimeConfig.heartbeat",
+      operations: ["read", "write"],
+    });
+    const authorization = authorizationService(db);
+    const actor = { type: "agent" as const, agentId: holder.id, companyId: company.id, source: "agent_jwt" as const };
+
+    for (const action of ["agent_config:read", "agent:wake"] as const) {
+      await expect(authorization.decide({
+        actor,
+        action,
+        resource: { type: "agent", companyId: company.id, agentId: target.id },
+        scope: { path: "runtimeConfig.heartbeat", operation: "read" },
+      })).resolves.toMatchObject({ allowed: false });
+    }
+  });
+
   it("treats unknown grant scope metadata as unconstrained", async () => {
     const company = await createCompany(db, "UnknownScopeMetadata");
     const actorAgent = await createAgent(db, company.id);

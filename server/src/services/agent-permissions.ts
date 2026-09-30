@@ -30,7 +30,6 @@ export function newStandardAgentGrantScope(
 export type NormalizedAgentPermissions = Record<string, unknown> & {
   canCreateAgents: boolean;
   canCreateSkills: boolean;
-  canManageFleetHeartbeat: boolean;
 };
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -73,7 +72,6 @@ export function defaultAgentPermissions(
   return {
     canCreateAgents: options?.context === "create" && options?.lowTrust !== true,
     canCreateSkills: true,
-    canManageFleetHeartbeat: false,
   };
 }
 
@@ -100,9 +98,5 @@ export function normalizeAgentPermissions(
       typeof record.canCreateSkills === "boolean"
         ? record.canCreateSkills
         : defaults.canCreateSkills,
-    canManageFleetHeartbeat:
-      typeof record.canManageFleetHeartbeat === "boolean"
-        ? record.canManageFleetHeartbeat
-        : defaults.canManageFleetHeartbeat,
   };
 }

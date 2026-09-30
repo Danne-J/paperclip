@@ -127,6 +127,7 @@ interface UpdateAgentOptions {
   allowBuiltInAgentMetadata?: boolean;
   allowPendingApprovalConfigUpdate?: boolean;
   claudeLogin?: ClaudeLoginContext;
+  afterUpdate?: (txDb: Db, updated: unknown) => Promise<void>;
 }
 
 interface CreateAgentOptions {
@@ -864,6 +865,10 @@ export function agentService(db: Db) {
             afterConfig: afterConfig as unknown as Record<string, unknown>,
           });
         }
+      }
+
+      if (options?.afterUpdate) {
+        await options.afterUpdate(txDb, normalizedUpdated);
       }
 
       return normalizedUpdated;

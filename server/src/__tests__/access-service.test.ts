@@ -88,6 +88,57 @@ describeEmbeddedPostgres("access service", () => {
     await tempDb?.cleanup();
   });
 
+  it("revokes only the single fleet heartbeat grant row", async () => {
+    const { company } = await createCompanyWithOwner(db);
+    const agent = await db.insert(agents).values({
+      companyId: company.id,
+      name: `Heartbeat holder ${randomUUID()}`,
+      role: "engineer",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    }).returning().then((rows) => rows[0]!);
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: agent.id,
+      status: "active",
+      membershipRole: "member",
+    });
+    await db.insert(principalPermissionGrants).values([
+      {
+        companyId: company.id,
+        principalType: "agent",
+        principalId: agent.id,
+        permissionKey: "agents:manage_fleet_heartbeat",
+        scope: { path: "runtimeConfig.heartbeat", operations: ["read", "write"] },
+      },
+      {
+        companyId: company.id,
+        principalType: "agent",
+        principalId: agent.id,
+        permissionKey: "tasks:assign",
+      },
+    ]);
+
+    await accessService(db).setPrincipalPermission(
+      company.id,
+      "agent",
+      agent.id,
+      "agents:manage_fleet_heartbeat",
+      false,
+      null,
+    );
+
+    const remaining = await db.select().from(principalPermissionGrants).where(and(
+      eq(principalPermissionGrants.companyId, company.id),
+      eq(principalPermissionGrants.principalType, "agent"),
+      eq(principalPermissionGrants.principalId, agent.id),
+    ));
+    expect(remaining.map((grant) => grant.permissionKey)).toEqual(["tasks:assign"]);
+  });
+
   it("rejects combined access updates that would demote the last active owner", async () => {
     const { company, owner } = await createCompanyWithOwner(db);
     const access = accessService(db);
