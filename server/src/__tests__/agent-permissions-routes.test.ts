@@ -798,6 +798,46 @@ describe("agent permission routes", () => {
     }));
   });
 
+  it("audits a holder writing a different agent's heartbeat with distinct actor and target", async () => {
+    const peerAgentId = "44444444-4444-4444-8444-444444444444";
+    const peer = {
+      ...baseAgent,
+      id: peerAgentId,
+      adapterConfig: { secret: "adapter-secret" },
+      runtimeConfig: { heartbeat: { enabled: true, intervalSec: 60 }, internal: "runtime-secret" },
+    };
+    mockAgentService.getById.mockImplementation(async (id: string) => id === peerAgentId ? peer : baseAgent);
+    mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+      allowed: input.action === "agent_heartbeat:write",
+      reason: input.action === "agent_heartbeat:write" ? "allow_test_grant" : "deny_missing_grant",
+      explanation: "Test policy decision",
+    }));
+    mockAgentService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>, options: { afterUpdate?: (db: unknown) => Promise<void> }) => {
+      await options?.afterUpdate?.({});
+      return { ...peer, runtimeConfig: patch.runtimeConfig };
+    });
+    const app = await createApp({ type: "agent", agentId, companyId, runId: "run-distinct", source: "agent_key" });
+
+    const response = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${peerAgentId}`)
+      .send({ runtimeConfig: { heartbeat: { intervalSec: 120 } } }));
+
+    expect(response.status).toBe(200);
+    expect(response.body.adapterConfig).toEqual({});
+    expect(response.body.runtimeConfig).toEqual({ heartbeat: { enabled: true, intervalSec: 120 } });
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "agent.heartbeat_policy_updated",
+      actorType: "agent",
+      agentId,
+      runId: "run-distinct",
+      entityType: "agent",
+      entityId: peerAgentId,
+      details: expect.objectContaining({
+        changes: { intervalSec: { before: 60, after: 120 } },
+      }),
+    }));
+  });
+
   it("rejects out-of-scope writes from a fleet heartbeat holder", async () => {
     mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
       allowed: input.action === "agent_heartbeat:write",

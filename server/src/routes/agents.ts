@@ -5922,7 +5922,7 @@ export function agentRoutes(
     }
 
     if (heartbeatOnlyPatch) {
-      res.json(agent);
+      res.json(redactForRestrictedAgentView(agent, { heartbeatOnly: true }));
       return;
     }
     await logActivity(db, {
