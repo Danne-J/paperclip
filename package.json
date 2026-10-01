@@ -128,7 +128,9 @@
       "react-dom": "^19.2.8",
       "@codemirror/state": "^6.7.2",
       "@codemirror/view": "^6.43.11",
-      "@lezer/common": "^1.5.2"
+      "@lezer/common": "^1.5.2",
+      "@assistant-ui/core": "0.3.15",
+      "assistant-cloud": "0.1.41"
     }
   }
 }

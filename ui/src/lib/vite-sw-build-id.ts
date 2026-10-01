@@ -73,9 +73,23 @@ export function serviceWorkerBuildIdPlugin(
     },
     closeBundle() {
       const swPath = path.resolve(outDir, serviceWorkerFileName);
-      const source = fs.readFileSync(swPath, "utf8");
+      // rolldown-vite (v8) copies publicDir AFTER closeBundle, so dist/sw.js
+      // may not exist yet; fall back to the public source so stamping still
+      // lands (the copy then overwrites it, so re-stamp after copy below).
+      const source = fs.existsSync(swPath)
+        ? fs.readFileSync(swPath, "utf8")
+        : fs.readFileSync(path.resolve("public", serviceWorkerFileName), "utf8");
       const stamped = stampServiceWorkerBuildId(source, buildId ?? "build");
       fs.writeFileSync(swPath, stamped);
+    },
+    // vite>=8 (rolldown): publicDir copy lands after closeBundle; restamp
+    // there so the copied placeholder does not clobber our stamp.
+    writeBundle() {
+      const swPath = path.resolve(outDir, serviceWorkerFileName);
+      if (!fs.existsSync(swPath)) return;
+      const source = fs.readFileSync(swPath, "utf8");
+      if (!source.includes(SERVICE_WORKER_BUILD_ID_PLACEHOLDER)) return;
+      fs.writeFileSync(swPath, stampServiceWorkerBuildId(source, buildId ?? "build"));
     },
   };
 }

@@ -1,0 +1,1 @@
+{"version":3,"file":"build-config.d.ts","sourceRoot":"","sources":["../../src/ui/build-config.ts"],"names":[],"mappings":"AAAA,OAAO,EAAyB,KAAK,kBAAkB,EAAE,MAAM,4BAA4B,CAAC;AAsB5F,wBAAgB,qBAAqB,CAAC,CAAC,EAAE,kBAAkB,GAAG,MAAM,CAAC,MAAM,EAAE,OAAO,CAAC,CAuCpF;AAUD,yEAAyE;AACzE,wBAAgB,0BAA0B,CAAC,CAAC,EAAE,kBAAkB,GAAG,MAAM,CAAC,MAAM,EAAE,OAAO,CAAC,CA2CzF"}
