@@ -15646,7 +15646,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // rather than silently leaving dependents stranded behind a missing
         // finalize row.
         await recordWorkspaceFinalize("succeeded");
-        if (issueRef?.completionRequirement === "workspace_delivery" && issueRef.projectWorkspaceId) {
+        const adapterDeliveredSuccessfully =
+          (adapterResult.exitCode ?? 0) === 0 && !adapterResult.errorMessage && !adapterResult.timedOut;
+        if (
+          adapterDeliveredSuccessfully &&
+          issueRef?.completionRequirement === "workspace_delivery" &&
+          issueRef.projectWorkspaceId
+        ) {
           const targetLocator = resolvedWorkspace.repoUrl ?? executionWorkspace.cwd;
           await recordProviderDeliveryAttestation({
             db, companyId: agent.companyId, issueId: issueRef.id, runId: run.id,

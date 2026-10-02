@@ -1,4 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   agents,
@@ -13,6 +17,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { deliveryAttestationService } from "../services/delivery-attestations.js";
+import { recordProviderDeliveryAttestation } from "../services/provider-delivery-attestation.js";
 import { issueService } from "../services/issues.js";
 import { computeTargetFingerprint } from "../services/workspace-target-fingerprint.js";
 
@@ -100,6 +105,70 @@ describeEmbeddedPostgres("delivery attestations", () => {
   }
 
   describe("deliveryAttestationService", () => {
+    it("records a succeeded attestation only after inspecting a clean checkout against its pushed ref", async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-delivery-attestation-provider-"));
+      const cwd = path.join(root, "checkout");
+      const remote = path.join(root, "remote.git");
+      try {
+        await fs.mkdir(cwd);
+        execFileSync("git", ["init", "--bare", remote]);
+        execFileSync("git", ["init", cwd]);
+        execFileSync("git", ["-C", cwd, "config", "user.name", "Paperclip test"]);
+        execFileSync("git", ["-C", cwd, "config", "user.email", "paperclip-test@example.invalid"]);
+        await fs.writeFile(path.join(cwd, "delivered.txt"), "provider checked\n");
+        execFileSync("git", ["-C", cwd, "add", "delivered.txt"]);
+        execFileSync("git", ["-C", cwd, "commit", "-m", "delivery"]);
+        execFileSync("git", ["-C", cwd, "push", remote, "HEAD:refs/heads/delivery"]);
+
+        const runId = await makeRun();
+        const issueId = await makeIssue({ completionRequirement: "workspace_delivery", completionRequirementRevision: 2 });
+        const { attestation, inspection } = await recordProviderDeliveryAttestation({
+          db, companyId, issueId, runId, declarationId: `projectWorkspace:${issueId}`,
+          declarationRevision: 2, targetFingerprint: computeTargetFingerprint(companyId, "git", remote),
+          cwd, repoUrl: remote, repoRef: "delivery",
+        });
+
+        expect(inspection.outcome).toBe("succeeded");
+        expect(inspection.deliveryMethod).toBe("push");
+        expect(inspection.deliveredRevision).toBe(inspection.sourceRevision);
+        expect(attestation.outcome).toBe("succeeded");
+        expect(attestation.runId).toBe(runId);
+        expect((await deliveryAttestationService(db).listForRun(runId, companyId))).toHaveLength(1);
+      } finally {
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    });
+
+    it("records a failed attestation when provider inspection cannot find the declared delivered ref", async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-delivery-attestation-missing-"));
+      const cwd = path.join(root, "checkout");
+      const remote = path.join(root, "remote.git");
+      try {
+        await fs.mkdir(cwd);
+        execFileSync("git", ["init", "--bare", remote]);
+        execFileSync("git", ["init", cwd]);
+        execFileSync("git", ["-C", cwd, "config", "user.name", "Paperclip test"]);
+        execFileSync("git", ["-C", cwd, "config", "user.email", "paperclip-test@example.invalid"]);
+        await fs.writeFile(path.join(cwd, "local.txt"), "not pushed\n");
+        execFileSync("git", ["-C", cwd, "add", "local.txt"]);
+        execFileSync("git", ["-C", cwd, "commit", "-m", "local only"]);
+
+        const runId = await makeRun();
+        const issueId = await makeIssue({ completionRequirement: "workspace_delivery", completionRequirementRevision: 3 });
+        const { attestation, inspection } = await recordProviderDeliveryAttestation({
+          db, companyId, issueId, runId, declarationId: `projectWorkspace:${issueId}`,
+          declarationRevision: 3, targetFingerprint: computeTargetFingerprint(companyId, "git", remote),
+          cwd, repoUrl: remote, repoRef: "delivery",
+        });
+
+        expect(inspection.outcome).toBe("failed");
+        expect(inspection.deliveryMethod).toBe("none");
+        expect(attestation.outcome).toBe("failed");
+      } finally {
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    });
+
     it("is append-only: a repeated call for the same operation key does not create a duplicate row", async () => {
       const svc = deliveryAttestationService(db);
       const runId = await makeRun();
