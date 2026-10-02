@@ -5227,9 +5227,20 @@ export function agentRoutes(
     if (req.actor.agentId === target.id) {
       throw forbidden("Agents cannot grant or revoke their own fleet heartbeat permission");
     }
+    if (
+      req.actor.source !== "agent_key" ||
+      !req.actor.keyId ||
+      (req.actor.keyScope && req.actor.keyScope.kind !== "standard")
+    ) {
+      throw forbidden("Fleet heartbeat permission changes require a standard agent API key");
+    }
     const actorAgent = req.actor.agentId ? await svc.getById(req.actor.agentId) : null;
     if (!actorAgent || actorAgent.companyId !== target.companyId || actorAgent.role !== "ceo") {
       throw forbidden("Only board or CEO can grant or revoke fleet heartbeat permission");
+    }
+    const trustPreset = await resolveAgentSelfTrustPreset(req, actorAgent);
+    if (trustPreset.kind !== "standard") {
+      throw forbidden("Fleet heartbeat permission changes require standard agent trust");
     }
   }
 

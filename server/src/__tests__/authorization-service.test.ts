@@ -2126,6 +2126,47 @@ describeEmbeddedPostgres("authorization service", () => {
       .resolves.toMatchObject({ allowed: false });
   });
 
+  it("rejects scoped and low-trust credentials even when the agent holds a heartbeat grant", async () => {
+    const company = await createCompany(db, "FleetHeartbeatCredentialBoundary");
+    const holder = await createAgent(db, company.id);
+    const target = await createAgent(db, company.id);
+    await grantAgentPermission(db, company.id, holder.id, "agents:manage_fleet_heartbeat", {
+      path: "runtimeConfig.heartbeat",
+      operations: ["read", "write"],
+    });
+    const authorization = authorizationService(db);
+    const resource = { type: "agent" as const, companyId: company.id, agentId: target.id };
+    for (const action of ["agent_heartbeat:read", "agent_heartbeat:write"] as const) {
+      const scope = { path: "runtimeConfig.heartbeat", operation: action.endsWith("read") ? "read" : "write" };
+      for (const keyScope of [
+        { kind: "task_bridge" as const, parentIssueId: randomUUID() },
+        { kind: "skill_test" as const, issueId: randomUUID() },
+      ]) {
+        await expect(authorization.decide({
+          actor: { type: "agent", agentId: holder.id, companyId: company.id, source: "agent_key", keyId: randomUUID(), keyScope },
+          action, resource, scope,
+        })).resolves.toMatchObject({ allowed: false, reason: "deny_scope" });
+      }
+      await expect(authorization.decide({
+        actor: { type: "agent", agentId: holder.id, companyId: company.id, source: "agent_key", keyScope: { kind: "standard" } },
+        action, resource, scope,
+      })).resolves.toMatchObject({ allowed: false, reason: "deny_scope" });
+    }
+
+    const lowTrustHolder = await createAgent(db, company.id, {
+      permissions: { trustPreset: LOW_TRUST_REVIEW_PRESET },
+    });
+    await grantAgentPermission(db, company.id, lowTrustHolder.id, "agents:manage_fleet_heartbeat", {
+      path: "runtimeConfig.heartbeat",
+      operations: ["read", "write"],
+    });
+    await expect(authorization.decide({
+      actor: { type: "agent", agentId: lowTrustHolder.id, companyId: company.id, source: "agent_jwt" },
+      action: "agent_heartbeat:read", resource,
+      scope: { path: "runtimeConfig.heartbeat", operation: "read" },
+    })).resolves.toMatchObject({ allowed: false });
+  });
+
   it("does not let a heartbeat grant authorize general config, secrets, or wake actions", async () => {
     const company = await createCompany(db, "HeartbeatCapabilityBoundary");
     const holder = await createAgent(db, company.id);

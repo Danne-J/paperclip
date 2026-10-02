@@ -1934,6 +1934,29 @@ export function authorizationService(db: Db | DbTransaction) {
     }
 
     if (input.action === "agent_heartbeat:read" || input.action === "agent_heartbeat:write") {
+      if (
+        (input.actor.keyScope && input.actor.keyScope.kind !== "standard") ||
+        (input.actor.source === "agent_key" && !input.actor.keyId)
+      ) {
+        return deny({
+          action: input.action,
+          reason: "deny_scope",
+          explanation: "Fleet heartbeat access requires a standard agent credential.",
+        });
+      }
+      const trustResolution = await resolveActorTrust({
+        actorAgent,
+        actor: input.actor,
+        companyId,
+        resource: input.resource,
+      });
+      if (trustResolution.kind !== "standard") {
+        return deny({
+          action: input.action,
+          reason: trustResolution.kind === "denied" ? "deny_policy_restricted" : "deny_low_trust_boundary",
+          explanation: "Fleet heartbeat access requires standard agent trust.",
+        });
+      }
       const operation = input.action === "agent_heartbeat:read" ? "read" : "write";
       if (
         input.resource.type !== "agent" ||

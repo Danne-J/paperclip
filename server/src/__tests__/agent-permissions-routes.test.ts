@@ -873,7 +873,7 @@ describe("agent permission routes", () => {
 
   it("prevents holders from granting their own or another agent's heartbeat permission", async () => {
     mockAgentService.getById.mockImplementation(async (id: string) => ({ ...baseAgent, id }));
-    const app = await createApp({ type: "agent", agentId, companyId, runId: "run-1", source: "agent_key" });
+    const app = await createApp({ type: "agent", agentId, companyId, runId: "run-1", source: "agent_key", keyId: "standard-key" });
 
     const selfGrant = await requestApp(app, (baseUrl) => request(baseUrl)
       .put(`/api/agents/${agentId}/fleet-heartbeat-permission`));
@@ -892,7 +892,7 @@ describe("agent permission routes", () => {
       id,
       role: id === agentId ? "ceo" : "engineer",
     }));
-    const app = await createApp({ type: "agent", agentId, companyId, runId: "run-1", source: "agent_key" });
+    const app = await createApp({ type: "agent", agentId, companyId, runId: "run-1", source: "agent_key", keyId: "standard-key" });
 
     const response = await requestApp(app, (baseUrl) => request(baseUrl)
       .put(`/api/agents/${peerAgentId}/fleet-heartbeat-permission`));
@@ -907,6 +907,40 @@ describe("agent permission routes", () => {
       null,
       { path: "runtimeConfig.heartbeat", operations: ["read", "write"] },
     );
+  });
+
+  it("denies CEO heartbeat grants and revocations from scoped or unidentified credentials", async () => {
+    const peerAgentId = "33333333-3333-4333-8333-333333333333";
+    mockAgentService.getById.mockImplementation(async (id: string) => ({
+      ...baseAgent, id, role: id === agentId ? "ceo" : "engineer",
+    }));
+    for (const actor of [
+      { type: "agent" as const, agentId, companyId, source: "agent_key" as const },
+      { type: "agent" as const, agentId, companyId, source: "agent_key" as const, keyId: "bridge-key", keyScope: { kind: "task_bridge" as const, parentIssueId: peerAgentId } },
+      { type: "agent" as const, agentId, companyId, source: "agent_key" as const, keyId: "skill-key", keyScope: { kind: "skill_test" as const, issueId: peerAgentId } },
+      { type: "agent" as const, agentId, companyId, source: "agent_jwt" as const },
+    ]) {
+      const app = await createApp(actor);
+      for (const method of ["put", "delete"] as const) {
+        const response = await requestApp(app, (baseUrl) => request(baseUrl)[method](`/api/agents/${peerAgentId}/fleet-heartbeat-permission`));
+        expect(response.status).toBe(403);
+      }
+    }
+    expect(mockAccessService.setPrincipalPermission).not.toHaveBeenCalled();
+  });
+
+  it("denies low-trust CEO heartbeat grants and revocations", async () => {
+    const peerAgentId = "33333333-3333-4333-8333-333333333333";
+    mockAgentService.getById.mockImplementation(async (id: string) => ({
+      ...baseAgent, id, role: id === agentId ? "ceo" : "engineer",
+      permissions: id === agentId ? { trustPreset: LOW_TRUST_REVIEW_PRESET } : baseAgent.permissions,
+    }));
+    const app = await createApp({ type: "agent", agentId, companyId, source: "agent_key", keyId: "standard-key" });
+    for (const method of ["put", "delete"] as const) {
+      const response = await requestApp(app, (baseUrl) => request(baseUrl)[method](`/api/agents/${peerAgentId}/fleet-heartbeat-permission`));
+      expect(response.status).toBe(403);
+    }
+    expect(mockAccessService.setPrincipalPermission).not.toHaveBeenCalled();
   });
 
   it("revokes the fleet heartbeat capability through one grant-row delete operation", async () => {
