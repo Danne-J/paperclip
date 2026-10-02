@@ -130,6 +130,7 @@ import {
 } from "./activity-log.js";
 import { buildIssueChanges } from "./issue-change-receipt.js";
 import { deliveryAttestationService } from "./delivery-attestations.js";
+import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
@@ -4349,6 +4350,38 @@ export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
   const deliveryAttestations = deliveryAttestationService(db);
+  const recoveryActions = issueRecoveryActionService(db);
+
+  async function recordDeliveryAttestationRecovery(input: {
+    companyId: string; issueId: string; runId: string; requirementRevision: number;
+  }) {
+    const run = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!run || ["queued", "running", "scheduled_retry"].includes(run.status)) return;
+
+    const fingerprint = createHash("sha256")
+      .update(`${input.issueId}:${input.requirementRevision}:${input.runId}`)
+      .digest("hex");
+    const existing = await recoveryActions.getActiveForIssue(input.companyId, input.issueId);
+    if (existing?.cause === "delivery_attestation_incomplete" && existing.fingerprint === fingerprint) return;
+    if ((existing?.attemptCount ?? 0) >= 3) return;
+
+    await recoveryActions.upsertSourceScoped({
+      companyId: input.companyId,
+      sourceIssueId: input.issueId,
+      kind: "delivery_attestation_incomplete",
+      ownerType: "board",
+      cause: "delivery_attestation_incomplete",
+      fingerprint,
+      evidence: { runId: input.runId, requirementRevision: input.requirementRevision, runStatus: run.status },
+      nextAction: "Retry delivery, obtain any typed provider confirmation, or correct the completion requirement through a board-authorized mutation. Do not automatically push, sync, or guess a target.",
+      wakePolicy: { type: "board_escalation", reason: "delivery_attestation_incomplete" },
+      maxAttempts: 3,
+    });
+  }
 
   function normalizeCreateIssueTitle(title: string) {
     return title.trim().replace(/\s+/g, " ").toLowerCase();
@@ -5453,6 +5486,13 @@ export function issueService(db: Db) {
       declarationRevision: input.completionRequirementRevision,
     });
     if (candidates.length > 0) return;
+
+    await recordDeliveryAttestationRecovery({
+      companyId: input.companyId,
+      issueId: input.issueId,
+      runId: input.expectedRunId,
+      requirementRevision: input.completionRequirementRevision,
+    });
 
     throw unprocessable("Delivery attestation is required to complete this issue", {
       code: "delivery_attestation_required",

@@ -17,6 +17,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { deliveryAttestationService } from "../services/delivery-attestations.js";
+import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recordProviderDeliveryAttestation } from "../services/provider-delivery-attestation.js";
 import { issueService } from "../services/issues.js";
 import { computeTargetFingerprint } from "../services/workspace-target-fingerprint.js";
@@ -299,11 +300,21 @@ describeEmbeddedPostgres("delivery attestations", () => {
   describe("terminal transition gate (issueService.update)", () => {
     it("rejects done for a workspace_delivery issue with no attestation", async () => {
       const svc = issueService(db);
+      const runId = await makeRun();
       const issueId = await makeIssue({ completionRequirement: "workspace_delivery", completionRequirementRevision: 0 });
 
-      await expect(svc.update(issueId, { status: "done" })).rejects.toMatchObject({
+      const rejectCompletion = () => svc.update(issueId, { status: "done", actorRunId: runId });
+      await expect(rejectCompletion()).rejects.toMatchObject({
         status: 422,
         details: expect.objectContaining({ code: "delivery_attestation_required" }),
+      });
+      await expect(rejectCompletion()).rejects.toMatchObject({ status: 422 });
+      const recovery = await issueRecoveryActionService(db).getActiveForIssue(companyId, issueId);
+      expect(recovery).toMatchObject({
+        kind: "delivery_attestation_incomplete",
+        cause: "delivery_attestation_incomplete",
+        attemptCount: 1,
+        maxAttempts: 3,
       });
     });
 

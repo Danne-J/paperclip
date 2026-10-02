@@ -328,6 +328,7 @@ export const ISSUE_RECOVERY_ACTION_KINDS = [
   "stranded_assigned_issue",
   "workspace_validation",
   "configuration_validation",
+  "delivery_attestation_incomplete",
   "active_run_watchdog",
   "issue_graph_liveness",
 ] as const;
