@@ -5255,7 +5255,7 @@ export function agentRoutes(
       "agents:manage_fleet_heartbeat",
       true,
       req.actor.type === "board" ? (req.actor.userId ?? null) : null,
-      { path: "runtimeConfig.heartbeat", operations: ["read", "write"] },
+      { path: "runtimeConfig.heartbeat", operations: ["read"] },
     );
     res.json({ permissionKey: "agents:manage_fleet_heartbeat", agentId: target.id, revoked: false });
   });

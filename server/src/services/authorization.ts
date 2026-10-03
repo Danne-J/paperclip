@@ -562,8 +562,10 @@ function scopeBoolean(scope: Record<string, unknown> | null | undefined, key: st
 
 function heartbeatGrantScopeAllows(scope: Record<string, unknown> | null | undefined, operation: "read" | "write") {
   if (!scope || scope.path !== "runtimeConfig.heartbeat") return false;
-  return Array.isArray(scope.operations) && scope.operations.length === 2 && scope.operations.includes(operation)
-    && scope.operations.includes(operation === "read" ? "write" : "read");
+  const operations = scope.operations;
+  return Array.isArray(operations) && operations.length > 0 &&
+    operations.every((candidate) => candidate === "read" || candidate === "write") &&
+    new Set(operations).size === operations.length && operations.includes(operation);
 }
 
 export function authorizationDeniedDetails(decision: AuthorizationDecision) {

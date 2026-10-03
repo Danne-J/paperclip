@@ -905,7 +905,7 @@ describe("agent permission routes", () => {
       "agents:manage_fleet_heartbeat",
       true,
       null,
-      { path: "runtimeConfig.heartbeat", operations: ["read", "write"] },
+      { path: "runtimeConfig.heartbeat", operations: ["read"] },
     );
   });
 
