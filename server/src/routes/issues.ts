@@ -15145,6 +15145,21 @@ export function issueRoutes(
         );
       }
 
+      // Checkout never went through the cross-issue-influence gate, but the
+      // PATCH/comment writes that follow it do, and that gate reads the
+      // run's source issue from this same contextSnapshot. Refresh it here so
+      // a run that checks out a different issue mid-run can still write to
+      // the issue it just checked out, instead of being judged against
+      // whatever (or nothing) its wake-time snapshot said.
+      if (updated && req.actor.type === "agent" && checkoutRunId) {
+        await db
+          .update(heartbeatRuns)
+          .set({
+            contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ issueId: issue.id })}::jsonb`,
+          })
+          .where(eq(heartbeatRuns.id, checkoutRunId));
+      }
+
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,

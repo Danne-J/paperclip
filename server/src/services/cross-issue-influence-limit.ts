@@ -1,6 +1,6 @@
-import { and, count, eq } from "drizzle-orm";
+import { and, count, eq, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, heartbeatRuns } from "@paperclipai/db";
+import { activityLog, heartbeatRuns, issues } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -110,13 +110,32 @@ export async function observeCrossIssueInfluence(
     }
 
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
     if (
-      sourceIssueId === input.targetIssueId ||
-      (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
+      sourceIssueId !== null &&
+      (sourceIssueId === input.targetIssueId ||
+        (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase()))
     ) {
       return null;
     }
+
+    // The wake-time snapshot is a point-in-time guess at "the issue this run is
+    // about" and is never refreshed mid-run by every write path (checkout is the
+    // only one that tries). Before failing closed on a stale or absent snapshot,
+    // check the live, authoritative signal: is this run the one actually holding
+    // the target issue right now? A run writing to the issue it has checked out
+    // or is executing is never "cross-issue," no matter what it woke up believing.
+    const heldIssue = await tx
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(
+        eq(issues.id, input.targetIssueId),
+        eq(issues.companyId, input.companyId),
+        or(eq(issues.checkoutRunId, input.runId), eq(issues.executionRunId, input.runId)),
+      ))
+      .then((rows) => rows[0] ?? null);
+    if (heldIssue) return null;
+
+    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
 
     const priorCount = await tx
       .select({ count: count() })

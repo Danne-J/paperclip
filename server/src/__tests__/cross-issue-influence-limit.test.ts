@@ -10,6 +10,7 @@ import {
 function counterDb(
   initialCount = 0,
   runOverrides: Record<string, unknown> | null = {},
+  options: { heldIssue?: boolean } = {},
 ) {
   let observedCount = initialCount;
   const inserted: Array<Record<string, unknown>> = [];
@@ -17,9 +18,20 @@ function counterDb(
     select: (selection: Record<string, unknown>) => ({
       from: () => ({
         where: () => {
-          if (Object.keys(selection).includes("count")) {
+          const keys = Object.keys(selection);
+          if (keys.includes("count")) {
             return {
               then: (resolve: (rows: unknown[]) => unknown) => resolve([{ count: observedCount }]),
+            };
+          }
+          // The "is this run currently holding the target issue" lookup
+          // selects only `id` and resolves without `.for("update")` — the
+          // locked run-row lookup below selects the full run projection and
+          // always calls `.for("update")`.
+          if (keys.length === 1 && keys[0] === "id") {
+            return {
+              then: (resolve: (rows: unknown[]) => unknown) =>
+                resolve(options.heldIssue ? [{ id: "55555555-5555-4555-8555-555555555555" }] : []),
             };
           }
           return {
@@ -211,6 +223,36 @@ describe("cross-issue influence limit rollout", () => {
       status: 403,
       details: { code: "cross_issue_influence_run_context_required" },
     });
+    expect(fake.inserted).toEqual([]);
+  });
+
+  it("does not fail closed when this run currently holds the target issue's checkout or execution lock, even with no source issue in the wake-time snapshot", async () => {
+    const fake = counterDb(0, { contextSnapshot: {} }, { heldIssue: true });
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "update",
+    })).resolves.toBeNull();
+    expect(fake.inserted).toEqual([]);
+  });
+
+  it("does not fail closed when this run holds the target issue even though the snapshot points at a different (stale) issue", async () => {
+    const fake = counterDb(
+      0,
+      { contextSnapshot: { issueId: "44444444-4444-4444-8444-444444444444" } },
+      { heldIssue: true },
+    );
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "comment",
+    })).resolves.toBeNull();
     expect(fake.inserted).toEqual([]);
   });
 });
