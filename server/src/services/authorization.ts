@@ -556,6 +556,25 @@ function activeResponsibleUserCanAuthorizeAgentGrantedSkillChange(
   );
 }
 
+function activeResponsibleUserCanAuthorizeAgentGrantedFleetHeartbeatAccess(
+  action: AuthorizationAction,
+  membership: ResponsibleUserSnapshot["activeMembership"],
+  agentDecision: AuthorizationDecision,
+  actorAgentId: string | null | undefined,
+) {
+  return Boolean(
+    (action === "agent_heartbeat:read" || action === "agent_heartbeat:write") &&
+    membership &&
+    membership.status === "active" &&
+    membership.membershipRole !== "viewer" &&
+    agentDecision.allowed &&
+    agentDecision.reason === "allow_explicit_grant" &&
+    agentDecision.grant?.principalType === "agent" &&
+    agentDecision.grant.principalId === actorAgentId &&
+    agentDecision.grant.permissionKey === "agents:manage_fleet_heartbeat",
+  );
+}
+
 function scopeBoolean(scope: Record<string, unknown> | null | undefined, key: string) {
   return scope?.[key] === true;
 }
@@ -2470,6 +2489,22 @@ export function authorizationService(db: Db | DbTransaction) {
       // grant. The responsible-user intersection still requires an active
       // non-viewer user, but does not require duplicating that grant on the
       // responsible user's board account for standard heartbeat JWTs.
+      return agentDecision;
+    }
+
+    if (
+      activeResponsibleUserCanAuthorizeAgentGrantedFleetHeartbeatAccess(
+        input.action,
+        snapshot.activeMembership,
+        agentDecision,
+        input.actor.agentId,
+      )
+    ) {
+      // Fleet heartbeat read/write is governed entirely by the agent's own
+      // agents:manage_fleet_heartbeat grant — there is no board-side action a
+      // human performs directly, so decideBase has no mapping for it and would
+      // otherwise deny every agent carrying this grant once a responsible user
+      // is attached (i.e. every normal heartbeat run).
       return agentDecision;
     }
 

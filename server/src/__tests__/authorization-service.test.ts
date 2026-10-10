@@ -2126,6 +2126,46 @@ describeEmbeddedPostgres("authorization service", () => {
       .resolves.toMatchObject({ allowed: false });
   });
 
+  it("does not let the responsible-user intersection strip a standing fleet heartbeat grant", async () => {
+    // Every normal heartbeat-run JWT carries onBehalfOfUserId for the agent's
+    // responsible board user. agent_heartbeat:read/write has no board-side
+    // action a human performs directly, so without a carve-out the
+    // intersection's decideBase({ type: "board", ... }) call always returns
+    // deny_unsupported_action and overrides an otherwise-valid agent grant
+    // (TRY-2025: fleet heartbeat list/detail routes always redacted
+    // runtimeConfig.heartbeat for real heartbeat-run callers).
+    const company = await createCompany(db, "FleetHeartbeatResponsibleUser");
+    const holder = await createAgent(db, company.id);
+    const target = await createAgent(db, company.id);
+    const responsibleUserId = await createUser(db);
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: responsibleUserId,
+      status: "active",
+      membershipRole: "member",
+    });
+    await grantAgentPermission(db, company.id, holder.id, "agents:manage_fleet_heartbeat", {
+      path: "runtimeConfig.heartbeat",
+      operations: ["read", "write"],
+    });
+
+    const decision = await authorizationService(db).decide({
+      actor: {
+        type: "agent",
+        agentId: holder.id,
+        companyId: company.id,
+        onBehalfOfUserId: responsibleUserId,
+        source: "agent_jwt",
+      },
+      action: "agent_heartbeat:read",
+      resource: { type: "agent", companyId: company.id, agentId: target.id },
+      scope: { path: "runtimeConfig.heartbeat", operation: "read" },
+    });
+
+    expect(decision).toMatchObject({ allowed: true, reason: "allow_explicit_grant" });
+  });
+
   it("rejects scoped and low-trust credentials even when the agent holds a heartbeat grant", async () => {
     const company = await createCompany(db, "FleetHeartbeatCredentialBoundary");
     const holder = await createAgent(db, company.id);
