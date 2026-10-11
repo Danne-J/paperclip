@@ -22,6 +22,32 @@ export type InspectIdlePlugins = (hold: { ownerId: string; expiresAt: number }) 
   pluginIds: string[];
 }>;
 
+// A failed turn may have successfully torn down its ephemeral allocation. A
+// cleanup label alone is not provider termination proof. Require the exact
+// host-owned receipt and finished run, and retain all cleanup/export intents.
+// Aliases are fixed at the call sites, never supplied by a client.
+function finishedFailedLease(alias: string): string {
+  const receipt = `${alias}.metadata->'remoteExecutionTermination'`;
+  return `${alias}.status = 'failed' AND ${alias}.lease_policy = 'ephemeral'
+    AND ${alias}.cleanup_status = 'success' AND ${alias}.released_at IS NOT NULL
+    AND COALESCE(${alias}.metadata->>'pendingCleanupInFlight', 'false') = 'false'
+    AND NOT (COALESCE(${alias}.metadata, '{}'::jsonb) ?| ARRAY['nativeWorkspaceExportResume', 'sandboxStopAndRetain'])
+    AND ${alias}.provider IS NOT NULL AND ${alias}.provider <> 'local'
+    AND ${alias}.provider_lease_id IS NOT NULL AND ${alias}.provider_lease_id <> ''
+    AND ${receipt}->>'schema' = 'paperclip.remote-termination.v1'
+    AND ${receipt}->>'companyId' = ${alias}.company_id::text
+    AND ${receipt}->>'runId' = ${alias}.heartbeat_run_id::text
+    AND ${receipt}->>'leaseId' = ${alias}.id::text
+    AND ${receipt}->>'provider' = ${alias}.provider
+    AND ${receipt}->>'providerLeaseId' = ${alias}.provider_lease_id
+    AND ${receipt}->>'state' IN ('stopped', 'destroyed')
+    AND EXISTS (SELECT 1 FROM heartbeat_runs r WHERE r.id = ${alias}.heartbeat_run_id
+      AND r.company_id = ${alias}.company_id
+      AND r.status IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted')
+      AND r.finished_at IS NOT NULL AND r.scheduled_retry_at IS NULL
+      AND r.cost_accounting_pending = false)`;
+}
+
 // These are deliberately conservative. Completed agent runs and workspace
 // operations are history, not reasons to keep an otherwise idle instance up.
 // Other background features remain awake until their work and inbound events
@@ -60,13 +86,18 @@ const WORK_CHECKS = [
   // retry after immediate evaluation failed before creating a review/run.
   `SELECT 1 FROM issue_watchdogs WHERE status <> 'disabled'`,
   `SELECT 1 FROM workspace_operations WHERE status NOT IN ('succeeded', 'failed', 'cancelled')`,
-  `SELECT 1 FROM environment_leases WHERE status NOT IN ('released', 'expired')`,
+  `SELECT 1 FROM environment_leases l WHERE status NOT IN ('released', 'expired')
+    AND (${finishedFailedLease("l")}) IS NOT TRUE`,
   `SELECT 1 FROM routines WHERE status NOT IN ('paused', 'archived')`,
   `SELECT 1 FROM routine_runs WHERE status NOT IN ('completed', 'failed', 'skipped', 'cancelled')`,
   `SELECT 1 FROM plugin_jobs WHERE status <> 'paused'`,
   `SELECT 1 FROM plugin_job_runs WHERE status NOT IN ('succeeded', 'failed', 'cancelled')`,
   `SELECT 1 FROM plugin_webhook_deliveries WHERE status NOT IN ('succeeded', 'failed')`,
-  `SELECT 1 FROM tool_connections WHERE status <> 'archived'`,
+  // Saved AI credentials have no independent worker. Login sessions, accepted
+  // quota/refresh work and recovery journals have their own checks. Other
+  // integrations still need an ingress/scheduler wake contract.
+  `SELECT 1 FROM tool_connections WHERE status <> 'archived'
+    AND NOT (status = 'active' AND connection_purpose = 'ai' AND transport = 'runtime_auth')`,
   `SELECT 1 FROM issue_recovery_actions WHERE status NOT IN ('resolved', 'cancelled')`,
   `SELECT 1 FROM status_cards WHERE archived_at IS NULL`,
   `SELECT 1 FROM external_objects WHERE NOT is_terminal OR next_refresh_at IS NOT NULL`,
@@ -83,7 +114,8 @@ const WORK_CHECKS = [
         AND (l.provider_lease_id = s.provider_lease_id OR l.id = CASE
           WHEN s.provider_lease_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
           THEN s.provider_lease_id::uuid END)
-        AND l.status IN ('released', 'expired') AND l.cleanup_status = 'success'
+        AND (l.status IN ('released', 'expired') OR (${finishedFailedLease("l")}))
+        AND l.cleanup_status = 'success'
         AND l.released_at IS NOT NULL))
     OR (s.provider_lease_id IS NOT NULL AND EXISTS (
       SELECT 1 FROM environment_leases l WHERE l.company_id = s.company_id
@@ -91,15 +123,40 @@ const WORK_CHECKS = [
         AND (l.provider_lease_id = s.provider_lease_id OR l.id = CASE
           WHEN s.provider_lease_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
           THEN s.provider_lease_id::uuid END)
-        AND (l.status IN ('released', 'expired') AND l.cleanup_status = 'success'
+        AND ((l.status IN ('released', 'expired') OR (${finishedFailedLease("l")})) AND l.cleanup_status = 'success'
           AND l.released_at IS NOT NULL) IS NOT TRUE))`,
+  // Answer delivery history is not work once its acknowledged handoff has
+  // finished. Keep pending deliveries, unfinished target runs, and missing or
+  // unfinished fallback wake receipts awake. Other work checks still apply.
+  `SELECT 1 FROM issue_question_response_deliveries d WHERE
+    d.status NOT IN ('delivered', 'fallback_queued', 'failed')
+    OR (d.status IN ('delivered', 'fallback_queued') AND d.acknowledged_at IS NULL)
+    OR (d.status = 'delivered' AND d.target_run_id IS NULL)
+    OR (d.target_run_id IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM heartbeat_runs r WHERE r.id = d.target_run_id
+        AND r.company_id = d.company_id
+        AND r.status IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted')
+        AND r.finished_at IS NOT NULL AND r.scheduled_retry_at IS NULL
+        AND r.cost_accounting_pending = false))
+    OR (d.status = 'fallback_queued' AND d.target_run_id IS NULL AND NOT EXISTS (
+      SELECT 1 FROM agent_wakeup_requests w WHERE w.company_id = d.company_id
+        AND w.idempotency_key = 'question-response:' || d.interaction_id::text
+        AND w.idempotency_key LIKE 'question-response:%'
+        AND w.finished_at IS NOT NULL
+        AND (w.status IN ('completed', 'failed', 'cancelled', 'skipped', 'timed_out')
+          OR (w.status = 'coalesced' AND EXISTS (
+            SELECT 1 FROM heartbeat_runs r WHERE r.id = w.run_id
+              AND r.company_id = w.company_id AND r.agent_id = w.agent_id
+              AND r.status IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted')
+              AND r.finished_at IS NOT NULL AND r.scheduled_retry_at IS NULL
+              AND r.cost_accounting_pending = false)))))`,
   // These less common work sources fail closed on any retained state. Their
   // terminal-state exceptions can be added with tests for the owning service.
   ...[
     "chat_endpoints", "chat_deliveries", "chat_publications", "chat_actions",
     "chat_completion_deliveries", "connection_event_deliveries",
     "connection_intent_deliveries", "tool_action_requests", "tool_action_deliveries",
-    "issue_question_response_deliveries", "workspace_runtime_services",
+    "workspace_runtime_services",
     "execution_workspace_runtime_leases", "pipeline_automation_executions",
     "native_run_finalizations", "company_transfer_runs", "decisions", "decision_effect_executions",
     "decision_archive_notification_outbox", "browser_use_sessions", "browser_use_runs",

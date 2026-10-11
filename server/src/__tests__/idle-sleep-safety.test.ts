@@ -5,7 +5,8 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   agentInstructionWorkingCopies, agents, agentApiKeys, agentWakeupRequests, companies, companySecretProposals, createDb,
   adapterAuthSessions, environments, environmentLeases, executionWorkspaces,
-  heartbeatRuns, issues, issueWatchdogs, projects, routines, type Db,
+  heartbeatRuns, issues, issueWatchdogs, issueThreadInteractions, issueQuestionResponseDeliveries,
+  projects, routines, toolApplications, toolConnections, type Db,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { readIdleSleepSafety, type IdleSleepDrainStatus } from "../services/idle-sleep-safety.js";
@@ -184,6 +185,152 @@ if (!support.supported) console.warn(`Skipping idle sleep Postgres tests: ${supp
     return { companyId, agentId, runId };
   }
 
+  async function seedQuestionDelivery(change: Partial<typeof issueQuestionResponseDeliveries.$inferInsert> = {}) {
+    const seeded = await seed();
+    await db.update(heartbeatRuns).set({ finishedAt: new Date(now) }).where(eq(heartbeatRuns.id, seeded.runId));
+    const issueId = randomUUID();
+    const interactionId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId: seeded.companyId, title: "Finished question", status: "done" });
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId, companyId: seeded.companyId, issueId,
+      kind: "ask_user_questions", status: "answered", payload: {},
+    });
+    await db.insert(issueQuestionResponseDeliveries).values({
+      companyId: seeded.companyId, issueId, interactionId, sourceRunId: seeded.runId,
+      targetRunId: seeded.runId, correlationId: randomUUID(), payloadSha256: "fixture",
+      status: "fallback_queued", deliveryMode: "wake_fallback", acknowledgedAt: new Date(now), ...change,
+    });
+    return { ...seeded, issueId, interactionId };
+  }
+
+  async function seedQuestionWake(
+    delivery: Awaited<ReturnType<typeof seedQuestionDelivery>>,
+    change: Partial<typeof agentWakeupRequests.$inferInsert> = {},
+  ) {
+    await db.insert(agentWakeupRequests).values({
+      companyId: delivery.companyId, agentId: delivery.agentId, source: "automation",
+      idempotencyKey: `question-response:${delivery.interactionId}`,
+      status: "completed", finishedAt: new Date(now), ...change,
+    });
+  }
+
+  it.each(["pending", "delivering"])("keeps a %s question delivery awake", async status => {
+    await seedQuestionDelivery({ status, acknowledgedAt: null });
+    expect(await read()).toEqual(present);
+  });
+
+  it.each(["delivered", "fallback_queued"])("permits acknowledged %s history after its target run finishes", async status => {
+    await seedQuestionDelivery({ status });
+    expect(await read()).toEqual(none);
+  });
+
+  it.each(["delivered", "fallback_queued"])("keeps an unacknowledged %s question delivery awake", async status => {
+    await seedQuestionDelivery({ status, acknowledgedAt: null });
+    expect(await read()).toEqual(present);
+  });
+
+  it.each([
+    ["queued", { status: "queued", finishedAt: null }],
+    ["running", { status: "running", finishedAt: null }],
+    ["unfinished", { finishedAt: null }],
+    ["retry", { scheduledRetryAt: new Date(now + 1000) }],
+    ["accounting", { costAccountingPending: true }],
+  ] as const)("keeps an acknowledged question delivery awake with %s target evidence", async (_name, change) => {
+    const { runId } = await seedQuestionDelivery();
+    await db.update(heartbeatRuns).set(change).where(eq(heartbeatRuns.id, runId));
+    expect(await read()).toEqual(present);
+  });
+
+  it("does not accept a foreign company's finished question target", async () => {
+    const foreign = await seedQuestionDelivery({ status: "failed", targetRunId: null });
+    await seedQuestionDelivery({ targetRunId: foreign.runId });
+    expect(await read()).toEqual(present);
+  });
+
+  it("keeps delivered history with a missing target awake", async () => {
+    await seedQuestionDelivery({ status: "delivered", targetRunId: null });
+    expect(await read()).toEqual(present);
+  });
+
+  it("keeps fallback history without a durable wake receipt awake", async () => {
+    await seedQuestionDelivery({ targetRunId: null });
+    expect(await read()).toEqual(present);
+  });
+
+  it.each(["completed", "failed", "cancelled", "skipped", "timed_out"])(
+    "permits fallback history after its exact durable wake is %s and finished", async status => {
+      const delivery = await seedQuestionDelivery({ targetRunId: null });
+      await seedQuestionWake(delivery, { status });
+      expect(await read()).toEqual(none);
+    },
+  );
+
+  it.each(["queued", "deferred_issue_execution", "coalesced"])("keeps an unresolved %s question wake awake", async status => {
+    const delivery = await seedQuestionDelivery({ targetRunId: null });
+    await seedQuestionWake(delivery, { status, finishedAt: null });
+    expect(await read()).toEqual(present);
+  });
+
+  it("keeps a terminal question wake without completion evidence awake", async () => {
+    const delivery = await seedQuestionDelivery({ targetRunId: null });
+    await seedQuestionWake(delivery, { finishedAt: null });
+    expect(await read()).toEqual(present);
+  });
+
+  it("permits a deferred question fallback after its coalesced continuation finishes", async () => {
+    const delivery = await seedQuestionDelivery({ targetRunId: null });
+    await seedQuestionWake(delivery, { status: "deferred_issue_execution", finishedAt: null });
+    expect(await read()).toEqual(present);
+    await db.update(agentWakeupRequests).set({
+      status: "coalesced", runId: delivery.runId, finishedAt: new Date(now),
+    }).where(eq(agentWakeupRequests.companyId, delivery.companyId));
+    expect(await read()).toEqual(none);
+  });
+
+  it.each(["missing_run", "wrong_company", "wrong_agent", "unfinished", "retry", "accounting"])(
+    "keeps a coalesced question fallback awake with %s linked-run evidence", async kind => {
+      const delivery = await seedQuestionDelivery({ targetRunId: null });
+      let runId = delivery.runId;
+      if (kind === "missing_run") runId = randomUUID();
+      if (kind === "wrong_company") runId = (await seedQuestionDelivery({ status: "failed", targetRunId: null })).runId;
+      if (kind === "wrong_agent") {
+        const otherAgent = randomUUID();
+        await db.insert(agents).values({ id: otherAgent, companyId: delivery.companyId, name: "Other", role: "engineer", status: "idle", adapterType: "process" });
+        await db.update(heartbeatRuns).set({ agentId: otherAgent }).where(eq(heartbeatRuns.id, runId));
+      }
+      if (kind === "unfinished") await db.update(heartbeatRuns).set({ finishedAt: null }).where(eq(heartbeatRuns.id, runId));
+      if (kind === "retry") await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(now + 1000) }).where(eq(heartbeatRuns.id, runId));
+      if (kind === "accounting") await db.update(heartbeatRuns).set({ costAccountingPending: true }).where(eq(heartbeatRuns.id, runId));
+      await seedQuestionWake(delivery, { status: "coalesced", runId });
+      expect(await read()).toEqual(present);
+    },
+  );
+
+  it("does not accept another interaction's or company's question wake receipt", async () => {
+    const delivery = await seedQuestionDelivery({ targetRunId: null });
+    await seedQuestionWake(delivery, { idempotencyKey: `question-response:${randomUUID()}` });
+    const foreign = await seedQuestionDelivery({ status: "failed", targetRunId: null });
+    await seedQuestionWake(delivery, { companyId: foreign.companyId, agentId: foreign.agentId });
+    expect(await read()).toEqual(present);
+  });
+
+  it("permits failed question-delivery history without a pending target", async () => {
+    await seedQuestionDelivery({ status: "failed", targetRunId: null, acknowledgedAt: null });
+    expect(await read()).toEqual(none);
+  });
+
+  it("still blocks other work after a question handoff finishes", async () => {
+    const { issueId } = await seedQuestionDelivery();
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, issueId));
+    expect(await read()).toEqual(present);
+  });
+
+  it("requires a current quiet owner even with completed question history", async () => {
+    await seedQuestionDelivery();
+    expect(await readIdleSleepSafety(db, owned, () => now, "stale-owner", emptyLocal)).toEqual(unknown);
+    expect(await readIdleSleepSafety(db, owned, () => now + 60_001, ownerId, emptyLocal)).toEqual(unknown);
+  });
+
   it("keeps saved agent files awake until deferred cleanup completes", async () => {
     const { companyId, agentId, runId } = await seed();
     await db.insert(agentInstructionWorkingCopies).values({
@@ -293,6 +440,124 @@ if (!support.supported) console.warn(`Skipping idle sleep Postgres tests: ${supp
   it("blocks a remote resource pending cleanup", async () => {
     const { companyId } = await seed();
     await db.insert(environmentLeases).values({ companyId, status: "pending_cleanup" });
+    expect(await read()).toEqual(present);
+  });
+
+  async function seedAiConnection() {
+    const seeded = await seed();
+    const [application] = await db.insert(toolApplications).values({
+      companyId: seeded.companyId, name: "AI fixture", type: "rest_api",
+    }).returning();
+    const [connection] = await db.insert(toolConnections).values({
+      companyId: seeded.companyId, applicationId: application!.id,
+      name: "Saved AI login", uid: randomUUID(), connectionPurpose: "ai",
+      transport: "runtime_auth", status: "active", enabled: true,
+    }).returning();
+    return { ...seeded, connection: connection! };
+  }
+
+  it("allows saved AI credentials while preserving their connection", async () => {
+    const { connection } = await seedAiConnection();
+    expect(await read()).toEqual(none);
+    expect(await db.select().from(toolConnections).where(eq(toolConnections.id, connection.id)))
+      .toMatchObject([{ status: "active", enabled: true }]);
+  });
+
+  it.each(["draft", "active_login", "pending_run", "accepted_refresh"])(
+    "keeps AI connections awake for %s work", async kind => {
+      const { companyId, runId, connection } = await seedAiConnection();
+      if (kind === "draft") await db.update(toolConnections).set({ status: "draft" }).where(eq(toolConnections.id, connection.id));
+      if (kind === "pending_run") await db.update(heartbeatRuns).set({ status: "queued" }).where(eq(heartbeatRuns.id, runId));
+      if (kind === "active_login") {
+        const [environment] = await db.insert(environments).values({ name: "Active AI login" }).returning();
+        await db.insert(adapterAuthSessions).values({
+          companyId, environmentId: environment!.id, connectionId: connection.id,
+          adapterType: "codex_local", startedByUserId: "fixture-user",
+          publicSessionId: randomUUID(), status: "waiting_for_user",
+        });
+      }
+      const finish = kind === "accepted_refresh" ? beginIdleTrackedWork() : undefined;
+      try { expect(await read()).toEqual(kind === "accepted_refresh" ? unknown : present); }
+      finally { finish?.(); }
+    },
+  );
+
+  it("retains remote MCP connections alongside inert AI credentials", async () => {
+    const { companyId, connection } = await seedAiConnection();
+    await db.insert(toolConnections).values({
+      companyId, applicationId: connection.applicationId, name: "Remote tools", uid: randomUUID(),
+      connectionPurpose: "tool", transport: "mcp_remote", status: "active", enabled: true,
+    });
+    expect(await read()).toEqual(present);
+  });
+
+  async function seedFinishedFailedLease() {
+    const seeded = await seed();
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(now) })
+      .where(eq(heartbeatRuns.id, seeded.runId));
+    const [environment] = await db.insert(environments).values({ name: "Failed turn environment", driver: "sandbox" }).returning();
+    const leaseId = randomUUID();
+    const receipt = {
+      schema: "paperclip.remote-termination.v1", companyId: seeded.companyId,
+      runId: seeded.runId, leaseId, provider: "plugin:demo:sandbox",
+      providerLeaseId: "fixture-resource", state: "destroyed", confirmedAt: new Date(now).toISOString(),
+    };
+    const [lease] = await db.insert(environmentLeases).values({
+      id: leaseId, companyId: seeded.companyId, environmentId: environment!.id,
+      heartbeatRunId: seeded.runId, status: "failed", leasePolicy: "ephemeral",
+      provider: receipt.provider, providerLeaseId: receipt.providerLeaseId,
+      acquiredAt: new Date(now - 1000), releasedAt: new Date(now), cleanupStatus: "success",
+      metadata: { remoteExecutionTermination: receipt },
+    }).returning();
+    return { ...seeded, environment: environment!, lease: lease!, receipt };
+  }
+
+  it.each(["destroyed", "stopped"])("allows failed lease history after exact provider %s proof", async state => {
+    const { lease, receipt } = await seedFinishedFailedLease();
+    await db.update(environmentLeases).set({ metadata: { remoteExecutionTermination: { ...receipt, state } } })
+      .where(eq(environmentLeases.id, lease.id));
+    expect(await read()).toEqual(none);
+    expect(await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))
+      .toMatchObject([{ status: "failed", cleanupStatus: "success" }]);
+  });
+
+  it.each([
+    "cleanup_failed", "cleanup_unknown", "unreleased", "retained_policy", "reusable_policy",
+    "active", "pending_cleanup", "missing_receipt", "wrong_company", "wrong_run", "wrong_lease",
+    "wrong_provider", "wrong_resource", "not_stopped", "missing_run", "unfinished_run",
+    "retry", "accounting", "cleanup_in_flight", "pending_export", "pending_retain",
+  ])("retains failed leases with %s evidence", async kind => {
+    const { lease, receipt, runId } = await seedFinishedFailedLease();
+    const change: Partial<typeof environmentLeases.$inferInsert> = {};
+    if (kind === "cleanup_failed") change.cleanupStatus = "failed";
+    if (kind === "cleanup_unknown") change.cleanupStatus = null;
+    if (kind === "unreleased") change.releasedAt = null;
+    if (kind === "retained_policy") change.leasePolicy = "retain_on_failure";
+    if (kind === "reusable_policy") change.leasePolicy = "reuse_by_environment";
+    if (kind === "active" || kind === "pending_cleanup") change.status = kind;
+    if (kind === "missing_receipt") change.metadata = {};
+    const fields: Record<string, string> = { wrong_company: "companyId", wrong_run: "runId", wrong_lease: "leaseId", wrong_provider: "provider", wrong_resource: "providerLeaseId", not_stopped: "state" };
+    if (fields[kind]) change.metadata = { remoteExecutionTermination: { ...receipt, [fields[kind]]: "wrong" } };
+    if (kind === "missing_run") change.heartbeatRunId = null;
+    if (kind === "unfinished_run") await db.update(heartbeatRuns).set({ finishedAt: null }).where(eq(heartbeatRuns.id, runId));
+    if (kind === "retry") await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(now + 1000) }).where(eq(heartbeatRuns.id, runId));
+    if (kind === "accounting") await db.update(heartbeatRuns).set({ costAccountingPending: true }).where(eq(heartbeatRuns.id, runId));
+    if (kind === "cleanup_in_flight") change.metadata = { remoteExecutionTermination: receipt, pendingCleanupInFlight: true };
+    if (kind === "pending_export") change.metadata = { remoteExecutionTermination: receipt, nativeWorkspaceExportResume: {} };
+    if (kind === "pending_retain") change.metadata = { remoteExecutionTermination: receipt, sandboxStopAndRetain: {} };
+    if (Object.keys(change).length) await db.update(environmentLeases).set(change).where(eq(environmentLeases.id, lease.id));
+    expect(await read()).toEqual(present);
+  });
+
+  it("uses the same failed-lease cleanup proof for finished login history", async () => {
+    const { companyId, environment, lease } = await seedFinishedFailedLease();
+    await db.insert(adapterAuthSessions).values({
+      companyId, environmentId: environment.id, adapterType: "codex_local", startedByUserId: "fixture-user",
+      publicSessionId: randomUUID(), providerLeaseId: lease.providerLeaseId,
+      status: "authenticated", finishedAt: new Date(now),
+    });
+    expect(await read()).toEqual(none);
+    await db.update(environmentLeases).set({ metadata: {} }).where(eq(environmentLeases.id, lease.id));
     expect(await read()).toEqual(present);
   });
 

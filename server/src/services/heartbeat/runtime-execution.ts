@@ -945,12 +945,12 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
           adapterDeliveredSuccessfully &&
           issueRef &&
           issueContext?.completionRequirement === "workspace_delivery" &&
-          issueRef.projectWorkspaceId
+          issueContext.projectWorkspaceId
         ) {
           const targetLocator = executionWorkspace.repoUrl ?? executionWorkspace.cwd;
           await recordProviderDeliveryAttestation({
             db, companyId: agent.companyId, issueId: issueRef.id, runId: run.id,
-            declarationId: `projectWorkspace:${issueRef.projectWorkspaceId}`,
+            declarationId: `projectWorkspace:${issueContext.projectWorkspaceId}`,
             declarationRevision: issueContext.completionRequirementRevision ?? 0,
             targetFingerprint: computeTargetFingerprint(agent.companyId, "git", targetLocator),
             cwd: executionWorkspace.cwd, repoUrl: executionWorkspace.repoUrl,
