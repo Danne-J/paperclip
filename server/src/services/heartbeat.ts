@@ -822,6 +822,7 @@ export {
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
   ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
 } from "./recovery/service.js";
+import { PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS } from "./recovery/service.js";
 export const ACTIVE_RUN_OUTPUT_PROGRESS_FLUSH_INTERVAL_MS = 60 * 1000;
 export const ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS = 5 * 1000;
 export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
@@ -17005,8 +17006,18 @@ export function heartbeatService(
     return cancelled;
   }
 
-  async function hasActionableTimerWork(agent: typeof agents.$inferSelect) {
-    const row = await db
+  // `skipTimerWhenNoActionableWork` must stay a no-op for a quota-paused
+  // agent even though it has a real todo/in_progress issue: that issue is
+  // not actually runnable again until its scheduled provider-quota retry
+  // (see ensureProviderQuotaWaitRecoveryMonitor) fires on its own. Without
+  // this exclusion, a bare generic timer wake (no issueId attached) read the
+  // issue as "actionable", invoked the adapter anyway, and immediately
+  // failed into another round of provider_quota — one of the two compounding
+  // causes of the 2026-10-07/08 quota incident (TRY-2042).
+  async function hasActionableTimerWork(
+    agent: typeof agents.$inferSelect,
+  ): Promise<{ hasWork: boolean; quotaPaused: boolean }> {
+    const candidateIssues = await db
       .select({ id: issues.id })
       .from(issues)
       .where(
@@ -17020,9 +17031,39 @@ export function heartbeatService(
           nonIdleSlackIssueCondition(),
         ),
       )
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
-    return Boolean(row);
+      // Bounded: only needed to tell whether every candidate is currently
+      // quota-paused, not to enumerate the agent's full assignment list.
+      .limit(20);
+    if (candidateIssues.length === 0) return { hasWork: false, quotaPaused: false };
+
+    const candidateIssueIds = candidateIssues.map((row) => row.id);
+    const quotaPausedIssueIds = await db
+      .select({
+        issueId: sql<string>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, agent.companyId),
+          eq(heartbeatRuns.agentId, agent.id),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          eq(heartbeatRuns.scheduledRetryReason, "provider_quota_recovery"),
+          gt(heartbeatRuns.scheduledRetryAt, new Date()),
+          inArray(
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
+            candidateIssueIds,
+          ),
+        ),
+      )
+      .then((rows) => new Set(rows.map((row) => row.issueId)));
+
+    const hasWork = candidateIssueIds.some(
+      (id) => !quotaPausedIssueIds.has(id),
+    );
+    return {
+      hasWork,
+      quotaPaused: !hasWork && quotaPausedIssueIds.size > 0,
+    };
   }
 
   async function markTimerHeartbeatChecked(
@@ -25980,7 +26021,58 @@ export function heartbeatService(
             outcome === "failed" &&
             readTransientRecoveryContractFromRun(livenessRun)
           ) {
-            await scheduleBoundedRetryForRun(livenessRun, agent);
+            const transientRecovery =
+              readTransientRecoveryContractFromRun(livenessRun)!;
+            if (
+              transientRecovery.errorFamily === "provider_quota" &&
+              !transientRecovery.retryNotBefore
+            ) {
+              // A provider's synthetic quota_exhausted fallback (e.g.
+              // claude-agent-acp's "The Claude account has no available
+              // quota.") carries no reset-time wording, so
+              // extractClaudeRetryNotBefore cannot parse one and this run's
+              // resultJson has no retryNotBefore. Scheduling the generic
+              // 30s-bounded retry (two attempts) here retried blindly into
+              // the still-exhausted quota on every failure, compounding with
+              // every regular timer tick re-triggering the same issue into
+              // hundreds of failed automation retries during the
+              // 2026-10-07/08 incident (TRY-2042).
+              //
+              // Skipping the bounded retry outright is not safe either: the
+              // wake-queue release path (runReleaseRecoveryTail) only treats
+              // a provider_quota failure as "released" (no immediate
+              // requeue) when scheduleBoundedRetryForRun has already left a
+              // scheduled_retry row behind (hasExistingExecutionPath).
+              // Without one, classifyContinuationFailure treats
+              // "provider_quota" as its ordinary "default" (retryable)
+              // case, and the release path queues a brand-new run with *no*
+              // delay at all — worse than the 30s storm. So this still calls
+              // scheduleBoundedRetryForRun, but overrides the delay to the
+              // same long default backoff the reset-time-aware stranded
+              // monitor (ensureProviderQuotaWaitRecoveryMonitor) uses when
+              // it cannot parse a reset time either, and tags the retry
+              // reason so hasActionableTimerWork can recognize and skip a
+              // quota-paused issue on a bare timer tick.
+              await appendRunEvent(livenessRun, {
+                eventType: "lifecycle",
+                stream: "system",
+                level: "warn",
+                message:
+                  "quota_paused: provider quota exhausted with no reset time in the message; retry deferred to the default backoff instead of automation-retrying immediately",
+                payload: {
+                  errorFamily: transientRecovery.errorFamily,
+                  retryNotBefore: null,
+                  backoffMs: PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS,
+                },
+              });
+              await scheduleBoundedRetryForRun(livenessRun, agent, {
+                retryReason: "provider_quota_recovery",
+                wakeReason: "provider_quota_recovery",
+                delayMs: PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS,
+              });
+            } else {
+              await scheduleBoundedRetryForRun(livenessRun, agent);
+            }
           } else if (
             outcome === "failed" &&
             !(await legacyExecutionNeedsReconciliationWithEvidence(db, livenessRun))
@@ -27478,17 +27570,22 @@ export function heartbeatService(
       !wakeCommentId &&
       !readNonEmptyString(enrichedContextSnapshot.taskId) &&
       !readNonEmptyString(enrichedContextSnapshot.taskKey);
-    if (
-      policy.skipTimerWhenNoActionableWork &&
-      genericTimerWake &&
-      !(await hasActionableTimerWork(agent))
-    ) {
-      await writeSkippedHeartbeatRequest("heartbeat.timer.no_actionable_work", {
-        reason:
-          "No assigned todo or in_progress issue requires this agent before timer adapter invocation.",
-      });
-      await markTimerHeartbeatChecked(agentId, source);
-      return null;
+    if (policy.skipTimerWhenNoActionableWork && genericTimerWake) {
+      const actionableTimerWork = await hasActionableTimerWork(agent);
+      if (!actionableTimerWork.hasWork) {
+        await writeSkippedHeartbeatRequest(
+          actionableTimerWork.quotaPaused
+            ? "heartbeat.timer.quota_paused"
+            : "heartbeat.timer.no_actionable_work",
+          {
+            reason: actionableTimerWork.quotaPaused
+              ? "Assigned work is waiting on a scheduled provider-quota retry; timer wake suppressed until it fires."
+              : "No assigned todo or in_progress issue requires this agent before timer adapter invocation.",
+          },
+        );
+        await markTimerHeartbeatChecked(agentId, source);
+        return null;
+      }
     }
 
     if (issueId) {

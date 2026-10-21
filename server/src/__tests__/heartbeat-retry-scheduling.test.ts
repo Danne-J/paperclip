@@ -64,12 +64,14 @@ import {
   MAX_TURN_CONTINUATION_WAKE_REASON,
   heartbeatService,
 } from "../services/heartbeat.ts";
+import { PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS } from "../services/recovery/service.ts";
 
 const mockedAppendHeartbeatRunEvent = vi.mocked(appendHeartbeatRunEvent);
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 const PROVIDER_QUOTA_TEST_ADAPTER = "provider_quota_test";
+const PROVIDER_QUOTA_NO_RESET_TEST_ADAPTER = "provider_quota_no_reset_test";
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -124,6 +126,33 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         testedAt: new Date().toISOString(),
       }),
     });
+    registerServerAdapter({
+      type: PROVIDER_QUOTA_NO_RESET_TEST_ADAPTER,
+      // Mirrors claude-agent-acp's synthetic quota_exhausted fallback (e.g.
+      // "The Claude account has no available quota."): a provider_quota
+      // failure with no reset-time wording anywhere in the message, so
+      // extractClaudeRetryNotBefore cannot parse a retryNotBefore and the
+      // adapter result carries none.
+      execute: async () => ({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage: "The Claude account has no available quota.",
+        errorCode: "provider_quota",
+        errorFamily: "provider_quota",
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+        resultJson: {
+          executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+          errorFamily: "provider_quota",
+        },
+      }),
+      testEnvironment: async () => ({
+        adapterType: PROVIDER_QUOTA_NO_RESET_TEST_ADAPTER,
+        status: "pass",
+        checks: [],
+        testedAt: new Date().toISOString(),
+      }),
+    });
   }, 20_000);
 
   afterEach(async () => {
@@ -140,6 +169,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
   afterAll(async () => {
     unregisterServerAdapter(PROVIDER_QUOTA_TEST_ADAPTER);
+    unregisterServerAdapter(PROVIDER_QUOTA_NO_RESET_TEST_ADAPTER);
     await tempDb?.cleanup();
   });
 
@@ -384,6 +414,107 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       "2030-04-22T21:00:00.000Z",
     );
     expect((retryRun?.contextSnapshot as Record<string, unknown> | null)?.codexTransientFallbackMode ?? null).toBeNull();
+
+    await expect
+      .poll(
+        () =>
+          db
+            .select({ status: agents.status, errorReason: agents.errorReason })
+            .from(agents)
+            .where(eq(agents.id, agentId))
+            .then((rows) => rows[0] ?? null),
+        { timeout: 5_000, interval: 50 },
+      )
+      .toEqual({ status: "idle", errorReason: null });
+  });
+
+  it("defers a synthetic quota_exhausted failure to the default backoff instead of automation-retrying immediately (TRY-f716cd0c)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Quota No-Reset Test",
+      role: "engineer",
+      status: "idle",
+      adapterType: PROVIDER_QUOTA_NO_RESET_TEST_ADAPTER,
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+        },
+      },
+      permissions: {},
+    });
+
+    const beforeInvoke = Date.now();
+    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(run).not.toBeNull();
+
+    const failedRun = await waitForRunToFinish(heartbeat, run!.id);
+    expect(failedRun?.status).toBe("failed");
+    expect(failedRun?.errorCode).toBe("provider_quota");
+    expect((failedRun?.resultJson as Record<string, unknown> | null)?.errorFamily).toBe("provider_quota");
+
+    // Exactly one follow-up is scheduled. Before the fix, the missing
+    // reset time fell through to the generic 30s-bounded retry
+    // (BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS), which would have
+    // retried into the still-exhausted quota within seconds instead of
+    // waiting for the default backoff.
+    await expect
+      .poll(
+        () =>
+          db
+            .select({ id: heartbeatRuns.id })
+            .from(heartbeatRuns)
+            .where(eq(heartbeatRuns.retryOfRunId, run!.id))
+            .then((rows) => rows.length),
+        { timeout: 5_000, interval: 50 },
+      )
+      .toBe(1);
+
+    const retryRun = await db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+        scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, run!.id))
+      .then((rows) => rows[0] ?? null);
+    expect(retryRun?.status).toBe("scheduled_retry");
+    // Tagged distinctly from the generic "transient_failure" bounded retry
+    // so hasActionableTimerWork can recognize and skip a quota-paused issue
+    // on a bare timer tick instead of re-invoking the adapter.
+    expect(retryRun?.scheduledRetryReason).toBe("provider_quota_recovery");
+    const scheduledDelayMs = (retryRun?.scheduledRetryAt?.getTime() ?? 0) - beforeInvoke;
+    expect(scheduledDelayMs).toBeGreaterThan(BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS[0]! * 10);
+    expect(
+      Math.abs(scheduledDelayMs - PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS),
+    ).toBeLessThan(30_000);
+    expect((retryRun?.contextSnapshot as Record<string, unknown> | null)?.wakeReason).toBe(
+      "provider_quota_recovery",
+    );
+
+    // Requirement: fail-fast logs a clear quota_paused event instead of an
+    // error cascade.
+    const quotaPausedEvents = mockedAppendHeartbeatRunEvent.mock.calls.filter(
+      ([, event]) =>
+        typeof event?.message === "string" && event.message.startsWith("quota_paused:"),
+    );
+    expect(quotaPausedEvents.length).toBeGreaterThan(0);
 
     await expect
       .poll(

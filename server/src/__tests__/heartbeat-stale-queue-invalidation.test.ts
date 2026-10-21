@@ -907,6 +907,60 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(agent?.lastHeartbeatAt?.getTime()).toBeGreaterThan(now.getTime() - 120_000);
   });
 
+  it("stays a no-op for a bare timer tick when the agent's only actionable issue is quota-paused (TRY-f716cd0c)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        enabled: true,
+        intervalSec: 60,
+        skipTimerWhenNoActionableWork: true,
+      },
+    });
+    const now = new Date();
+    await db
+      .update(agents)
+      .set({ lastHeartbeatAt: new Date(now.getTime() - 120_000) })
+      .where(eq(agents.id, agentId));
+
+    // A real todo/in_progress issue exists (hasActionableTimerWork's old
+    // check alone would treat this as actionable), but it is waiting on a
+    // scheduled provider-quota retry, so a bare generic timer tick (no
+    // issueId attached) must still stay a no-op instead of invoking the
+    // adapter again before the scheduled retry fires.
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Quota-paused issue",
+      status: "in_progress",
+      assigneeAgentId: agentId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "scheduled_retry",
+      scheduledRetryAt: new Date(now.getTime() + 60 * 60 * 1000),
+      scheduledRetryAttempt: 1,
+      scheduledRetryReason: "provider_quota_recovery",
+      contextSnapshot: { issueId, wakeReason: "provider_quota_recovery" },
+      updatedAt: now,
+    });
+
+    const firstTick = await heartbeat.tickTimers(now);
+
+    expect(firstTick.skipped).toBe(1);
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+
+    const wakeups = await db
+      .select({ reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeups).toHaveLength(1);
+    expect(wakeups[0]?.reason).toBe("heartbeat.timer.quota_paused");
+  });
+
   it("atomically claims a due timer interval across overlapping scheduler ticks", async () => {
     const { agentId } = await seedCompanyAndAgent({
       heartbeatConfig: {
