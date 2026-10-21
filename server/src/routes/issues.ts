@@ -204,6 +204,7 @@ import {
   routineService,
   workProductService,
 } from "../services/index.js";
+import { deliveryAttestationService } from "../services/delivery-attestations.js";
 import {
   runnerGoalService,
   RunnerGoalActionError,
@@ -3480,6 +3481,7 @@ export function issueRoutes(
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const executionWorkspacesSvc = executionWorkspaceServiceDirect(db, { pluginWorkerManager: opts.pluginWorkerManager });
   const workProductsSvc = workProductService(db);
+  const deliveryAttestationsSvc = deliveryAttestationService(db);
   const documentsSvc = documentService(db);
   const artifactReviewDocumentsSvc = artifactReviewDocumentService(db, storage);
   const companySkillsSvc = companySkillService(db);
@@ -10392,6 +10394,20 @@ export function issueRoutes(
       refreshPullRequests: req.query.refreshPullRequests === "true",
     });
     res.json(workProducts);
+  });
+
+  router.get("/issues/:id/delivery-attestations", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(
+      req,
+      res,
+      getIssueById(req, id),
+      "Issue not found",
+    );
+    if (!issue) return;
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    const attestations = await deliveryAttestationsSvc.listForIssue(issue.id, issue.companyId);
+    res.json(attestations);
   });
 
   router.get("/issues/:id/external-objects", async (req, res) => {

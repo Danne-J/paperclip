@@ -225,6 +225,8 @@ import {
   type ActivityPublication,
 } from "./activity-log.js";
 import { buildIssueChanges } from "./issue-change-receipt.js";
+import { deliveryAttestationService } from "./delivery-attestations.js";
+import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { ensurePersonalPrivateProject } from "./projects.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
@@ -5017,6 +5019,8 @@ const issueListSelect = {
   unblockDescriptor: issues.unblockDescriptor,
   blockedTransitionAt: issues.blockedTransitionAt,
   blockedOwnerNotifiedAt: issues.blockedOwnerNotifiedAt,
+  completionRequirement: issues.completionRequirement,
+  completionRequirementRevision: issues.completionRequirementRevision,
   startedAt: issues.startedAt,
   completedAt: issues.completedAt,
   cancelledAt: issues.cancelledAt,
@@ -6751,6 +6755,39 @@ export async function readIssueCommentRunLogText(run: {
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
+  const deliveryAttestations = deliveryAttestationService(db);
+  const recoveryActions = issueRecoveryActionService(db);
+
+  async function recordDeliveryAttestationRecovery(input: {
+    companyId: string; issueId: string; runId: string; requirementRevision: number;
+  }) {
+    const run = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!run || ["queued", "running", "scheduled_retry"].includes(run.status)) return;
+
+    const fingerprint = createHash("sha256")
+      .update(`${input.issueId}:${input.requirementRevision}:${input.runId}`)
+      .digest("hex");
+    const existing = await recoveryActions.getActiveForIssue(input.companyId, input.issueId);
+    if (existing?.cause === "delivery_attestation_incomplete" && existing.fingerprint === fingerprint) return;
+    if ((existing?.attemptCount ?? 0) >= 3) return;
+
+    await recoveryActions.upsertSourceScoped({
+      companyId: input.companyId,
+      sourceIssueId: input.issueId,
+      kind: "delivery_attestation_incomplete",
+      ownerType: "board",
+      cause: "delivery_attestation_incomplete",
+      fingerprint,
+      evidence: { runId: input.runId, requirementRevision: input.requirementRevision, runStatus: run.status },
+      nextAction: "Retry delivery, obtain any typed provider confirmation, or correct the completion requirement through a board-authorized mutation. Do not automatically push, sync, or guess a target.",
+      wakePolicy: { type: "board_escalation", reason: "delivery_attestation_incomplete" },
+      maxAttempts: 3,
+    });
+  }
 
   function provisionalTitleFromDescription(description: string) {
     const simpleTitle = description.trim().replace(/\s+/g, " ").slice(0, 120);
@@ -8045,6 +8082,73 @@ export function issueService(db: Db) {
       return existing;
     };
     return dbOrTx === db ? db.transaction(runArchive) : runArchive(dbOrTx);
+  }
+
+  /**
+   * Terminal `done`-transition gate for `workspace_delivery` issues
+   * (doc/execution-semantics.md, "Terminal transition contract"). Requires a
+   * `succeeded` delivery attestation scoped to this exact company + issue +
+   * completion-requirement revision. Scoping by issueId (rather than, say,
+   * just companyId or providerKey) is what prevents an unrelated sibling
+   * run's attestation from satisfying this issue's completion.
+   */
+  async function assertDeliveryAttestationSatisfied(input: {
+    companyId: string;
+    issueId: string;
+    completionRequirement: string | null;
+    completionRequirementRevision: number;
+    expectedRunId: string | null;
+    deliveryAttestationId?: string;
+  }) {
+    if (input.completionRequirement !== "workspace_delivery") return;
+
+    if (!input.expectedRunId) {
+      throw unprocessable("Delivery attestation is required to complete this issue", {
+        code: "delivery_attestation_required",
+        completionRequirementRevision: input.completionRequirementRevision,
+        reason: "delivery_run_required",
+      });
+    }
+
+    if (input.deliveryAttestationId) {
+      const attestation = await deliveryAttestations.getById(input.deliveryAttestationId, {
+        companyId: input.companyId,
+        issueId: input.issueId,
+      });
+      if (
+        attestation &&
+        attestation.outcome === "succeeded" &&
+        attestation.runId === input.expectedRunId &&
+        attestation.declarationRevision === input.completionRequirementRevision
+      ) {
+        return;
+      }
+      throw unprocessable("Delivery attestation is required to complete this issue", {
+        code: "delivery_attestation_required",
+        completionRequirementRevision: input.completionRequirementRevision,
+      });
+    }
+
+    const candidates = await deliveryAttestations.findSucceededForIssue({
+      companyId: input.companyId,
+      issueId: input.issueId,
+      runId: input.expectedRunId,
+      declarationRevision: input.completionRequirementRevision,
+    });
+    if (candidates.length > 0) return;
+
+    await recordDeliveryAttestationRecovery({
+      companyId: input.companyId,
+      issueId: input.issueId,
+      runId: input.expectedRunId,
+      requirementRevision: input.completionRequirementRevision,
+    });
+
+    throw unprocessable("Delivery attestation is required to complete this issue", {
+      code: "delivery_attestation_required",
+      completionRequirementRevision: input.completionRequirementRevision,
+      matchingAttestationCount: candidates.length,
+    });
   }
 
   const service = {
@@ -10361,6 +10465,16 @@ export function issueService(db: Db) {
             projectWorkspaceId,
             tx,
           );
+          if (issueData.completionRequirement === undefined) {
+            const workspace = await tx
+              .select({ defaultCompletionRequirement: projectWorkspaces.defaultCompletionRequirement })
+              .from(projectWorkspaces)
+              .where(and(eq(projectWorkspaces.companyId, companyId), eq(projectWorkspaces.id, projectWorkspaceId)))
+              .then((rows) => rows[0] ?? null);
+            if (workspace?.defaultCompletionRequirement != null) {
+              issueData.completionRequirement = workspace.defaultCompletionRequirement;
+            }
+          }
         }
         if (
           isolatedWorkspacesEnabled &&
@@ -10928,6 +11042,7 @@ export function issueService(db: Db) {
         workspaceSelectionActor?: AuthorizationActor;
         expectedExecutionPolicy?: typeof issues.$inferInsert.executionPolicy;
         expectedStatusVersion?: number;
+        deliveryAttestationId?: string;
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -10979,6 +11094,7 @@ export function issueService(db: Db) {
         workspaceSelectionActor,
         expectedExecutionPolicy,
         expectedStatusVersion,
+        deliveryAttestationId,
         ...issueData
       } = data;
       if (expectedStatusVersion !== undefined && (
@@ -11198,6 +11314,17 @@ export function issueService(db: Db) {
           executionWorkspacePreference:
             nextExecutionWorkspacePreference ?? null,
           executionWorkspaceSettings: issueData.executionWorkspaceSettings,
+        });
+      }
+
+      if (patch.status === "done" && existing.status !== "done") {
+        await assertDeliveryAttestationSatisfied({
+          companyId: existing.companyId,
+          issueId: existing.id,
+          completionRequirement: existing.completionRequirement,
+          completionRequirementRevision: existing.completionRequirementRevision,
+          expectedRunId: actorRunId ?? existing.executionRunId,
+          deliveryAttestationId,
         });
       }
 

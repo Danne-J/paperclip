@@ -2752,6 +2752,20 @@
       "when": 1793152860397,
       "tag": "0394_conscious_whizzer",
       "breakpoints": true
+    },
+    {
+      "idx": 395,
+      "version": "7",
+      "when": 1792544912793,
+      "tag": "0395_issue_completion_requirement",
+      "breakpoints": true
+    },
+    {
+      "idx": 396,
+      "version": "7",
+      "when": 1792544913793,
+      "tag": "0396_delivery_attestations",
+      "breakpoints": true
     }
   ]
 }

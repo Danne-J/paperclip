@@ -1102,6 +1102,7 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     identifier: string | null;
     projectId: string | null;
     projectWorkspaceId: string | null;
+    completionRequirement?: string | null;
   } | null;
   resolvedWorkspace: ResolvedWorkspaceForRun;
   executionWorkspace: RealizedExecutionWorkspace;
@@ -1298,6 +1299,21 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
         },
       );
     }
+  }
+
+  if (
+    workspaceExpectation &&
+    !input.resolvedWorkspace.repoUrl &&
+    input.resolvedWorkspace.source === "project_primary" &&
+    issue.completionRequirement === "workspace_delivery"
+  ) {
+    fail(
+      "null_repo_delivery_required",
+      `Issue ${issue.identifier ?? issue.id} requires workspace delivery but the project_primary workspace has no repository URL. ` +
+      `A project_primary folder without a repository locator cannot be an authoritative repository checkout. ` +
+      `Set a repository URL on the project workspace or change the issue completion requirement to evidence_only or artifact.`,
+      { completionRequirement: issue.completionRequirement, resolvedWorkspaceSource: input.resolvedWorkspace.source },
+    );
   }
 }
 

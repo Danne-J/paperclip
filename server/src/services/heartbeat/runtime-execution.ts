@@ -27,6 +27,8 @@ import { buildAgentIdentityEnv } from "@paperclipai/adapter-utils/server-utils";
 import { externalObjectService } from "../external-objects.js";
 import { isAgentDirectoryCopy } from "../agent-directory-working-copies.js";
 import { restoreNativeWorkspaceBestEffort } from "../native-runtime/native-workspace-best-effort.js";
+import { recordProviderDeliveryAttestation } from "../provider-delivery-attestation.js";
+import { computeTargetFingerprint } from "../workspace-target-fingerprint.js";
 import {
   withNativeWorkspaceFinalizationOwnership,
   NativeWorkspaceFinalizationBusyError,
@@ -955,6 +957,25 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
           ));
         const workspaceFinalizeStatus = hasWorkspaceRestoreFailure(adapterResult.resultJson) ? "failed" : "succeeded";
         await recordWorkspaceFinalize(workspaceFinalizeStatus);
+        const adapterDeliveredSuccessfully =
+          (adapterResult.exitCode ?? 0) === 0 && !adapterResult.errorMessage && !adapterResult.timedOut;
+        if (
+          workspaceFinalizeStatus === "succeeded" &&
+          adapterDeliveredSuccessfully &&
+          issueRef &&
+          issueContext?.completionRequirement === "workspace_delivery" &&
+          issueContext.projectWorkspaceId
+        ) {
+          const targetLocator = executionWorkspace.repoUrl ?? executionWorkspace.cwd;
+          await recordProviderDeliveryAttestation({
+            db, companyId: agent.companyId, issueId: issueRef.id, runId: run.id,
+            declarationId: `projectWorkspace:${issueContext.projectWorkspaceId}`,
+            declarationRevision: issueContext.completionRequirementRevision ?? 0,
+            targetFingerprint: computeTargetFingerprint(agent.companyId, "git", targetLocator),
+            cwd: executionWorkspace.cwd, repoUrl: executionWorkspace.repoUrl,
+            repoRef: executionWorkspace.branchName ?? executionWorkspace.repoRef,
+          });
+        }
         if (adapterResult.nativeFinalization) {
           adapterResult.nativeFinalization.workspaceFinalizeStatus =
             workspaceFinalizeStatus;

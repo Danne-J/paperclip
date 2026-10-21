@@ -170,6 +170,7 @@ export {
 } from "./environment-custom-image-terminal-sessions.js";
 export { executionWorkspaceService } from "./execution-workspaces.js";
 export { workspaceOperationService } from "./workspace-operations.js";
+export { deliveryAttestationService, type DeliveryAttestationRow } from "./delivery-attestations.js";
 export {
   workspaceRuntimeLeaseService,
   buildWorkspaceRuntimeLeaseOwnerKey,

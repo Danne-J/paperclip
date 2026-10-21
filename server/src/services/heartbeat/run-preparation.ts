@@ -2937,6 +2937,8 @@ export function createHeartbeatRunPreparation(db: Db) {
         originIdentityContextId: issues.originIdentityContextId,
         continuationIdentityContextId: issues.continuationIdentityContextId,
         updatedAt: issues.updatedAt,
+        completionRequirement: issues.completionRequirement,
+        completionRequirementRevision: issues.completionRequirementRevision,
       })
       .from(issues)
       .leftJoin(chatConversations, and(

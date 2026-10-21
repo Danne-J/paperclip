@@ -3195,6 +3195,7 @@ export function heartbeatService(
                 identifier: issueRef.identifier,
                 projectId: issueRef.projectId,
                 projectWorkspaceId: issueRef.projectWorkspaceId,
+                completionRequirement: issueContext?.completionRequirement,
               }
             : null,
           resolvedWorkspace,

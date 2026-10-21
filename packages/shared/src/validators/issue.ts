@@ -953,6 +953,10 @@ export const updateIssueSchema = objectWithoutDefaults(
     /** Assignment-only handoff; the following structured goal action owns the wake. */
     deferWakeForGoal: z.boolean().optional(),
     hiddenAt: z.string().datetime().nullable().optional(),
+    // References (rather than supplies) provider-generated delivery evidence
+    // for a workspace_delivery terminal transition; see
+    // doc/execution-semantics.md, "Terminal transition contract".
+    deliveryAttestationId: z.string().uuid().optional(),
   });
 
 export type UpdateIssue = z.infer<typeof updateIssueSchema>;

@@ -129,6 +129,7 @@ import {
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
+import { deliveryAttestationService } from "../services/delivery-attestations.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { runAdapterLoginStartSpine } from "./adapter-login-route-spine.js";
 import { isLoginCommandSupportedAdapterType } from "../services/login-command.js";
@@ -801,6 +802,7 @@ export function agentRoutes(
   }
   const companySkills = companySkillService(db);
   const workspaceOperations = workspaceOperationService(db);
+  const deliveryAttestations = deliveryAttestationService(db);
   const instanceSettings = instanceSettingsService(db);
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
 
@@ -7630,6 +7632,15 @@ export function agentRoutes(
       if (await canActorReadWorkspaceOperation(db, access, req.actor, operation)) visibleOperations.push(operation);
     }
     res.json(redactCurrentUserValue(visibleOperations, await getCurrentUserRedactionOptions()));
+  });
+
+  router.get("/heartbeat-runs/:runId/delivery-attestations", async (req, res) => {
+    const runId = req.params.runId as string;
+    const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
+    if (!run) return;
+
+    const attestations = await deliveryAttestations.listForRun(runId, run.companyId);
+    res.json(attestations);
   });
 
   router.get("/workspace-operations/:operationId/log", async (req, res) => {

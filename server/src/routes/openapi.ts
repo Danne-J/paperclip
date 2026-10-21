@@ -4435,6 +4435,15 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/issues/{id}/delivery-attestations",
+  tags: ["issues"],
+  summary: "List delivery attestations for an issue",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/issues/{id}/work-products",
   tags: ["issues"],
   summary: "List issue work products",
@@ -7813,6 +7822,15 @@ registry.registerPath({
     }),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/heartbeat-runs/{runId}/delivery-attestations",
+  tags: ["runs"],
+  summary: "List delivery attestations for a heartbeat run",
+  request: { params: z.object({ runId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
 });
 
 registry.registerPath({
