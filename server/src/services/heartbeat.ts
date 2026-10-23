@@ -109,6 +109,7 @@ import {
   lt,
   lte,
   ne,
+  notExists,
   notInArray,
   or,
   sql,
@@ -17017,53 +17018,47 @@ export function heartbeatService(
   async function hasActionableTimerWork(
     agent: typeof agents.$inferSelect,
   ): Promise<{ hasWork: boolean; quotaPaused: boolean }> {
-    const candidateIssues = await db
+    const candidateIssueCondition = and(
+      eq(issues.companyId, agent.companyId),
+      eq(issues.assigneeAgentId, agent.id),
+      isNull(issues.assigneeUserId),
+      isNull(issues.hiddenAt),
+      inArray(issues.status, [...TIMER_ACTIONABLE_ISSUE_STATUSES]),
+      isNull(issues.conversationAgentId),
+      nonIdleSlackIssueCondition(),
+    );
+    const quotaPausedRunForIssue = (issueId: typeof issues.id) =>
+      db
+        .select({ one: sql`1` })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, agent.companyId),
+            eq(heartbeatRuns.agentId, agent.id),
+            eq(heartbeatRuns.status, "scheduled_retry"),
+            eq(heartbeatRuns.scheduledRetryReason, "provider_quota_recovery"),
+            gt(heartbeatRuns.scheduledRetryAt, new Date()),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}::text`,
+          ),
+        );
+
+    // Existence checks, not a fetch-then-diff-in-JS over a capped page: an
+    // arbitrary LIMIT here previously let an unrelated quota-paused issue
+    // crowd a real actionable one out of the sampled page, misreporting
+    // quotaPaused for an agent with real work outstanding.
+    const unpausedCandidate = await db
       .select({ id: issues.id })
       .from(issues)
-      .where(
-        and(
-          eq(issues.companyId, agent.companyId),
-          eq(issues.assigneeAgentId, agent.id),
-          isNull(issues.assigneeUserId),
-          isNull(issues.hiddenAt),
-          inArray(issues.status, [...TIMER_ACTIONABLE_ISSUE_STATUSES]),
-          isNull(issues.conversationAgentId),
-          nonIdleSlackIssueCondition(),
-        ),
-      )
-      // Bounded: only needed to tell whether every candidate is currently
-      // quota-paused, not to enumerate the agent's full assignment list.
-      .limit(20);
-    if (candidateIssues.length === 0) return { hasWork: false, quotaPaused: false };
+      .where(and(candidateIssueCondition, notExists(quotaPausedRunForIssue(issues.id))))
+      .limit(1);
+    if (unpausedCandidate.length > 0) return { hasWork: true, quotaPaused: false };
 
-    const candidateIssueIds = candidateIssues.map((row) => row.id);
-    const quotaPausedIssueIds = await db
-      .select({
-        issueId: sql<string>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
-      })
-      .from(heartbeatRuns)
-      .where(
-        and(
-          eq(heartbeatRuns.companyId, agent.companyId),
-          eq(heartbeatRuns.agentId, agent.id),
-          eq(heartbeatRuns.status, "scheduled_retry"),
-          eq(heartbeatRuns.scheduledRetryReason, "provider_quota_recovery"),
-          gt(heartbeatRuns.scheduledRetryAt, new Date()),
-          inArray(
-            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
-            candidateIssueIds,
-          ),
-        ),
-      )
-      .then((rows) => new Set(rows.map((row) => row.issueId)));
-
-    const hasWork = candidateIssueIds.some(
-      (id) => !quotaPausedIssueIds.has(id),
-    );
-    return {
-      hasWork,
-      quotaPaused: !hasWork && quotaPausedIssueIds.size > 0,
-    };
+    const anyCandidate = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(candidateIssueCondition)
+      .limit(1);
+    return { hasWork: false, quotaPaused: anyCandidate.length > 0 };
   }
 
   async function markTimerHeartbeatChecked(

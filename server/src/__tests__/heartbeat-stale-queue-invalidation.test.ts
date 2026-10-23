@@ -961,6 +961,82 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(wakeups[0]?.reason).toBe("heartbeat.timer.quota_paused");
   });
 
+  it("still finds real actionable work past a 20-row scan when most candidates are quota-paused", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        enabled: true,
+        intervalSec: 60,
+        skipTimerWhenNoActionableWork: true,
+      },
+    });
+    const now = new Date();
+
+    // Force a sequential scan so the candidate rows come back in physical
+    // (insertion) order instead of whatever index-scan order the planner
+    // would otherwise pick. That makes this test deterministically exercise
+    // the old bug: an unordered LIMIT 20 over a heap-ordered scan would
+    // return the 25 earlier-inserted paused issues and cut off the
+    // last-inserted real one.
+    await db.execute(sql.raw("SET enable_indexscan = off"));
+    await db.execute(sql.raw("SET enable_bitmapscan = off"));
+    try {
+      // 25 quota-paused issues, more than the old fetch's LIMIT 20, plus one
+      // real actionable issue. The old fetch-then-diff-in-JS approach could
+      // have the real issue scanned outside the capped page (Postgres gives
+      // no ordering guarantee without ORDER BY) while 20 paused ones fill
+      // it, which would wrongly report quotaPaused instead of hasWork.
+      for (let i = 0; i < 25; i += 1) {
+        const pausedIssueId = randomUUID();
+        await db.insert(issues).values({
+          id: pausedIssueId,
+          companyId,
+          title: `Quota-paused issue ${i}`,
+          status: "in_progress",
+          assigneeAgentId: agentId,
+        });
+        await db.insert(heartbeatRuns).values({
+          id: randomUUID(),
+          companyId,
+          agentId,
+          invocationSource: "automation",
+          triggerDetail: "system",
+          status: "scheduled_retry",
+          scheduledRetryAt: new Date(now.getTime() + 60 * 60 * 1000),
+          scheduledRetryAttempt: 1,
+          scheduledRetryReason: "provider_quota_recovery",
+          contextSnapshot: { issueId: pausedIssueId, wakeReason: "provider_quota_recovery" },
+          updatedAt: now,
+        });
+      }
+      await db.insert(issues).values({
+        id: randomUUID(),
+        companyId,
+        title: "Real actionable work",
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: agentId,
+      });
+
+      const run = await heartbeat.wakeup(agentId, {
+        source: "timer",
+        triggerDetail: "schedule",
+      });
+
+      expect(run).not.toBeNull();
+      await waitForCondition(async () => countExecuteCallsForRun(run!.id) > 0);
+      expect(countExecuteCallsForRun(run!.id)).toBe(1);
+
+      const wakeups = await db
+        .select({ reason: agentWakeupRequests.reason })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId));
+      expect(wakeups.every((w) => w.reason !== "heartbeat.timer.quota_paused")).toBe(true);
+    } finally {
+      await db.execute(sql.raw("SET enable_indexscan = on"));
+      await db.execute(sql.raw("SET enable_bitmapscan = on"));
+    }
+  });
+
   it("atomically claims a due timer interval across overlapping scheduler ticks", async () => {
     const { agentId } = await seedCompanyAndAgent({
       heartbeatConfig: {
