@@ -8,8 +8,10 @@ import {
   asString,
   parseObject,
   readPaperclipIssueWorkModeFromContext,
-  renderPaperclipWakePrompt,
+  selectPaperclipPromptSections,
+  isPaperclipRecoveryWakePayload,
   stringifyPaperclipWakePayload,
+  paperclipWakeCommentsArePromptOwned,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
   ADAPTER_TYPE,
@@ -262,9 +264,25 @@ function buildHeaders(input: {
 }
 
 function buildInput(ctx: AdapterExecutionContext, paperclipApiUrl: string | null): string {
-  const wakePrompt = renderPaperclipWakePrompt(ctx.context.paperclipWake);
-  const wakePayloadJson = stringifyPaperclipWakePayload(ctx.context.paperclipWake);
-  const taskMarkdown = nonEmpty(ctx.context.paperclipTaskMarkdown);
+  // Stable session keys (issue/agent strategy) resume the same remote Hermes
+  // conversation across runs; a stored session id from a prior run means that
+  // conversation already received the task brief, so pick the compact
+  // task-context variant under the shared resume rules.
+  const sessionKeyStrategy = normalizeSessionKeyStrategy(ctx.config.sessionKeyStrategy);
+  const resumedSession =
+    (sessionKeyStrategy === "issue" || sessionKeyStrategy === "agent") &&
+    Boolean(nonEmpty(ctx.runtime?.sessionId));
+  const { taskContextNote: taskMarkdown, wakePrompt } = selectPaperclipPromptSections(ctx.context, {
+    resumedSession,
+    // Hermes gateway owns the execution contract below; retain the old
+    // gateway prompt shape and avoid adding a second contract on resume.
+    includeExecutionContract: false,
+  });
+  const wakePayloadJson = paperclipWakeCommentsArePromptOwned(ctx.context)
+    ? null
+    : stringifyPaperclipWakePayload(ctx.context.paperclipWake, {
+        omitIssueDescription: Boolean(taskMarkdown),
+      });
   const sessionHandoff = nonEmpty(ctx.context.paperclipSessionHandoffMarkdown);
   const issueWorkMode = readPaperclipIssueWorkModeFromContext(ctx.context);
   const lines = [
@@ -277,12 +295,16 @@ function buildInput(ctx: AdapterExecutionContext, paperclipApiUrl: string | null
     ...(paperclipApiUrl ? [`- Paperclip API URL: ${paperclipApiUrl}`] : []),
     ...(issueWorkMode ? [`- Issue work mode: ${issueWorkMode}`] : []),
     "",
-    "Execution contract:",
-    "- Take concrete action in this run when the task is actionable.",
-    "- Do not stop at a plan unless the issue asks for planning only.",
-    "- Leave durable progress and update the issue to a clear final disposition.",
-    "- Use X-Paperclip-Run-Id on mutating Paperclip API requests when a Paperclip API key is available.",
-    "",
+    ...(ctx.context.conversationMode === true || isPaperclipRecoveryWakePayload(ctx.context.paperclipWake)
+      ? []
+      : [
+          "Execution contract:",
+          "- Take concrete action in this run when the task is actionable.",
+          "- Do not stop at a plan unless the issue asks for planning only.",
+          "- Leave durable progress and update the issue to a clear final disposition.",
+          "- Use X-Paperclip-Run-Id on mutating Paperclip API requests when a Paperclip API key is available.",
+          "",
+        ]),
     wakePrompt,
     ...(sessionHandoff ? ["", sessionHandoff] : []),
     ...(taskMarkdown ? ["", taskMarkdown] : []),
@@ -302,7 +324,10 @@ function buildInput(ctx: AdapterExecutionContext, paperclipApiUrl: string | null
 function buildRunBody(ctx: AdapterExecutionContext, sessionKey: string | null): Record<string, unknown> {
   const paperclipApiUrl = nonEmpty(ctx.config.paperclipApiUrl);
   const payloadTemplate = parseObject(ctx.config.payloadTemplate);
-  const input = nonEmpty(payloadTemplate.input) ?? buildInput(ctx, paperclipApiUrl);
+  const configuredInput = nonEmpty(payloadTemplate.input);
+  const input = configuredInput && ctx.context.conversationMode === true
+    ? `${configuredInput}\n\n${buildInput(ctx, paperclipApiUrl)}`
+    : configuredInput ?? buildInput(ctx, paperclipApiUrl);
   const instructions =
     nonEmpty(ctx.config.instructions) ??
     nonEmpty(payloadTemplate.instructions) ??
@@ -852,6 +877,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   let runId: string | null = null;
   try {
+    // This adapter has no local child process, so crossing into the first
+    // remote create request is its dispatch boundary. Report it before the
+    // request can block so continuation gates may release their issue lock.
+    ctx.onDispatch?.();
     const created = await fetchJson(createRunUrl, {
       method: "POST",
       headers: runHeaders,

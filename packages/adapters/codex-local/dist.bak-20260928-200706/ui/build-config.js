@@ -1,0 +1,121 @@
+import { buildAdapterEnvConfig } from "@paperclipai/adapter-utils";
+import { DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX } from "../index.js";
+function parseCommaArgs(value) {
+    return value
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean);
+}
+function parseJsonObject(text) {
+    const trimmed = text.trim();
+    if (!trimmed)
+        return null;
+    try {
+        const parsed = JSON.parse(trimmed);
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+            return null;
+        return parsed;
+    }
+    catch {
+        return null;
+    }
+}
+export function buildCodexLocalConfig(v) {
+    const ac = {};
+    if (v.cwd)
+        ac.cwd = v.cwd;
+    if (v.instructionsFilePath)
+        ac.instructionsFilePath = v.instructionsFilePath;
+    if (v.model)
+        ac.model = v.model;
+    if (v.thinkingEffort)
+        ac.modelReasoningEffort = v.thinkingEffort;
+    if (v.codexEngine === "cli" || v.codexEngine === "acp")
+        ac.engine = v.codexEngine;
+    if (v.codexEngine === "acp") {
+        if (v.codexAcpAgentCommand)
+            ac.agentCommand = v.codexAcpAgentCommand;
+        ac.mode = v.codexAcpMode ?? "persistent";
+        ac.nonInteractivePermissions = v.codexAcpNonInteractivePermissions ?? "deny";
+        if (v.codexAcpStateDir)
+            ac.stateDir = v.codexAcpStateDir;
+        ac.warmHandleIdleMs = v.codexAcpWarmHandleIdleMs ?? 0;
+    }
+    ac.timeoutSec = 0;
+    ac.graceSec = 15;
+    const env = buildAdapterEnvConfig(v.envBindings, v.envVars);
+    if (Object.keys(env).length > 0)
+        ac.env = env;
+    ac.search = v.search;
+    ac.fastMode = v.fastMode;
+    ac.dangerouslyBypassApprovalsAndSandbox =
+        typeof v.dangerouslyBypassSandbox === "boolean"
+            ? v.dangerouslyBypassSandbox
+            : DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX;
+    if (v.workspaceStrategyType === "git_worktree") {
+        ac.workspaceStrategy = {
+            type: "git_worktree",
+            ...(v.workspaceBaseRef ? { baseRef: v.workspaceBaseRef } : {}),
+            ...(v.workspaceBranchTemplate ? { branchTemplate: v.workspaceBranchTemplate } : {}),
+            ...(v.worktreeParentDir ? { worktreeParentDir: v.worktreeParentDir } : {}),
+        };
+    }
+    const runtimeServices = parseJsonObject(v.runtimeServicesJson ?? "");
+    if (runtimeServices && Array.isArray(runtimeServices.services)) {
+        ac.workspaceRuntime = runtimeServices;
+    }
+    if (v.command)
+        ac.command = v.command;
+    if (v.extraArgs)
+        ac.extraArgs = parseCommaArgs(v.extraArgs);
+    return ac;
+}
+function paperclipRunnerProvider(value) {
+    return value === "opencode" ? "opencode" : "codex";
+}
+function openCodePermissionMode(value) {
+    return value === "ask" || value === "deny" ? value : "allow";
+}
+/** Build a provider profile accepted by the experimental Rust runner. */
+export function buildPaperclipRunnerConfig(v) {
+    const config = buildCodexLocalConfig(v);
+    for (const unsupportedKey of [
+        "engine",
+        "agentCommand",
+        "mode",
+        "nonInteractivePermissions",
+        "stateDir",
+        "warmHandleIdleMs",
+        "dangerouslyBypassApprovalsAndSandbox",
+        "dangerouslyBypassSandbox",
+        "instructionsFilePath",
+        "modelReasoningEffort",
+        "search",
+        "fastMode",
+        "command",
+        "extraArgs",
+    ]) {
+        delete config[unsupportedKey];
+    }
+    const schemaValues = v.adapterSchemaValues ?? {};
+    const provider = paperclipRunnerProvider(schemaValues.provider);
+    if (provider === "codex") {
+        return { ...config, provider };
+    }
+    const lifecycleMode = schemaValues.lifecycleMode === "warm" ? "warm" : "per_turn";
+    const configuredIdleTimeoutMs = schemaValues.idleTimeoutMs;
+    const idleTimeoutMs = typeof configuredIdleTimeoutMs === "number"
+        && Number.isSafeInteger(configuredIdleTimeoutMs)
+        && configuredIdleTimeoutMs > 0
+        ? configuredIdleTimeoutMs
+        : 300_000;
+    return {
+        ...config,
+        provider,
+        model: v.model || "openrouter/deepseek/deepseek-v4-flash-0731",
+        opencodePermissionMode: openCodePermissionMode(schemaValues.opencodePermissionMode),
+        lifecycleMode,
+        ...(lifecycleMode === "warm" ? { idleTimeoutMs } : {}),
+    };
+}
+//# sourceMappingURL=build-config.js.map
