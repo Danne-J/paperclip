@@ -152,6 +152,10 @@ import {
 import { issueService } from "./issues.js";
 import { recordProviderDeliveryAttestation } from "./provider-delivery-attestation.js";
 import { computeTargetFingerprint } from "./workspace-target-fingerprint.js";
+import {
+  resolveWorkspaceTargetDeclaration,
+  workspaceTargetDeclarationRecoveryFingerprint,
+} from "./workspace-target-declaration.js";
 import { projectService } from "./projects.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { createToolGatewayService } from "./tool-gateway.js";
@@ -14199,6 +14203,42 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       companyId: agent.companyId,
       issueId,
     });
+    // Pre-dispatch gate outcome: doc/execution-semantics.md, "Pre-dispatch
+    // validity". A workspace_delivery issue with no resolvable, enabled,
+    // same-scope, fingerprint-matching target declaration must not dispatch;
+    // it blocks here as configuration_incomplete rather than dispatching a
+    // run that can never produce a satisfying delivery attestation.
+    if (issueContext && issueContext.completionRequirement === "workspace_delivery") {
+      const workspaceTargetDeclarationResolution = await resolveWorkspaceTargetDeclaration({
+        db,
+        companyId: agent.companyId,
+        issueId: issueContext.id,
+        projectId: issueContext.projectId ?? null,
+        projectWorkspaceId: issueContext.projectWorkspaceId ?? null,
+        completionRequirement: issueContext.completionRequirement,
+      });
+      if (!workspaceTargetDeclarationResolution.ok) {
+        throw new ConfigurationIncompleteFailure(
+          `configuration incomplete: workspace target declaration ${workspaceTargetDeclarationResolution.reason} (${workspaceTargetDeclarationResolution.detail})`,
+          {
+            configurationIncomplete: {
+              reason: `workspace_target_${workspaceTargetDeclarationResolution.reason}`,
+              companyId: agent.companyId,
+              agentId: agent.id,
+              issueId: issueContext.id,
+              projectId: issueContext.projectId ?? null,
+              routineId: routineEnvContext.routineId,
+              recoveryFingerprint: workspaceTargetDeclarationRecoveryFingerprint({
+                issueId: issueContext.id,
+                completionRequirementRevision: issueContext.completionRequirementRevision,
+                declarationRevision: null,
+              }),
+              detail: workspaceTargetDeclarationResolution.detail,
+            },
+          },
+        );
+      }
+    }
     const pushCapabilityPreflightRequired = requiresPushCapabilityPreflight({
       adapterType: agent.adapterType,
       issueId,
