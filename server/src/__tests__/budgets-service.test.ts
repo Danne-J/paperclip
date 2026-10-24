@@ -9,9 +9,10 @@ import {
   companies,
   costEvents,
   createDb,
+  heartbeatRuns,
   projects,
 } from "@paperclipai/db";
-import { budgetService } from "../services/budgets.ts";
+import { ACCOUNTING_PENDING_GRACE_MS, budgetService } from "../services/budgets.ts";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -43,6 +44,7 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
     await db.delete(approvals);
     await db.delete(budgetPolicies);
     await db.delete(costEvents);
+    await db.delete(heartbeatRuns);
     await db.delete(projects);
     await db.delete(agents);
     await db.delete(companies);
@@ -111,6 +113,26 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
       .returning();
 
     return event!;
+  }
+
+  async function insertFailedRunPendingAccounting(input: {
+    companyId: string;
+    agentId: string;
+    finishedAt: Date;
+    runtimeMode?: string;
+  }) {
+    const [run] = await db
+      .insert(heartbeatRuns)
+      .values({
+        companyId: input.companyId,
+        agentId: input.agentId,
+        status: "failed",
+        finishedAt: input.finishedAt,
+        costAccountingPending: true,
+        runtimeMode: input.runtimeMode ?? "legacy",
+      })
+      .returning();
+    return run!;
   }
 
   it("raises one soft incident per window before hard-stopping and safely logging agent telemetry", async () => {
@@ -354,5 +376,102 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
       pauseReason: null,
     });
     expect(overviewAfterResume.activeIncidents).toHaveLength(0);
+  });
+
+  // JEN-42: a legacy-runtime run that finishes with cost_accounting_pending
+  // set (receipts exist but never settled into the ledger) must not read as
+  // a budget breach, and must not pause an agent before accounting has had a
+  // reasonable chance to settle.
+  it("does not pause an agent for a recently finished run still pending accounting", async () => {
+    const { companyId, agentId } = await createBudgetFixture();
+    const cancelWorkForScope = vi.fn().mockResolvedValue(undefined);
+    const service = budgetService(db, { cancelWorkForScope });
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "agent",
+      scopeId: agentId,
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 50000,
+      warnPercent: 80,
+      hardStopEnabled: true,
+      notifyEnabled: true,
+      isActive: true,
+    });
+
+    const run = await insertFailedRunPendingAccounting({
+      companyId,
+      agentId,
+      finishedAt: new Date(),
+    });
+
+    // Reproduces the original incident's trigger path: a periodic policy
+    // reconcile sweep, with no new cost event at all (the run's receipts
+    // carried $0, so evaluateCostEvent never fired).
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+
+    const [agentRow] = await db.select({ status: agents.status, pauseReason: agents.pauseReason }).from(agents);
+    expect(agentRow).toEqual({ status: "active", pauseReason: null });
+    expect(await db.select().from(budgetIncidents)).toHaveLength(0);
+    expect(cancelWorkForScope).not.toHaveBeenCalled();
+
+    // The run is still there, still pending, untouched by this check.
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0]?.costAccountingPending).toBe(true);
+  });
+
+  it("pauses with an honest, run-naming reason once pending accounting goes stale — never a false $0 breach", async () => {
+    const { companyId, agentId } = await createBudgetFixture();
+    const cancelWorkForScope = vi.fn().mockResolvedValue(undefined);
+    const service = budgetService(db, { cancelWorkForScope });
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "agent",
+      scopeId: agentId,
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 50000,
+      warnPercent: 80,
+      hardStopEnabled: true,
+      notifyEnabled: true,
+      isActive: true,
+    });
+
+    const staleFinishedAt = new Date(Date.now() - ACCOUNTING_PENDING_GRACE_MS - 60_000);
+    const run = await insertFailedRunPendingAccounting({ companyId, agentId, finishedAt: staleFinishedAt });
+
+    const block = await service.getInvocationBlock(companyId, agentId);
+    expect(block).toMatchObject({ scopeType: "agent", scopeId: agentId });
+    expect(block?.reason).toContain(run.id);
+    expect(block?.reason).toContain("not a spend breach");
+
+    const [incident] = await db.select().from(budgetIncidents);
+    expect(incident).toMatchObject({
+      companyId,
+      scopeType: "agent",
+      scopeId: agentId,
+      thresholdType: "hard",
+      amountLimit: 50000,
+      amountObserved: 0,
+      status: "open",
+    });
+
+    const [agentRow] = await db.select({ status: agents.status, pauseReason: agents.pauseReason }).from(agents);
+    expect(agentRow).toEqual({ status: "paused", pauseReason: "budget" });
+
+    const telemetryCalls = mockLogActivity.mock.calls.map(([, input]) => input);
+    expect(telemetryCalls).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          action: "budget.accounting_pending_blocked",
+          details: expect.objectContaining({
+            scopeType: "agent",
+            scopeId: agentId,
+            reasons: ["accounting_pending"],
+            stalePendingRunIds: [run.id],
+            stalePendingRunCount: 1,
+          }),
+        }),
+      ]),
+    );
   });
 });

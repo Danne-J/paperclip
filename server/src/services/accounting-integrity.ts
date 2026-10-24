@@ -68,6 +68,30 @@ async function inspect(tx: Db, companyId: string): Promise<AccountingInspection>
   return { companyId, findings, fingerprint: receiptFingerprint({ companyId, findings }), checkedAt: new Date().toISOString() };
 }
 
+export type StaleAccountingPendingRun = { companyId: string; runId: string; agentId: string; finishedAt: string; ageMs: number };
+
+/** Watchdog for JEN-42 proposed-fix item 4: a run whose `cost_accounting_pending`
+ * flag outlives `ACCOUNTING_PENDING_GRACE_MS` (budgets.ts) is already treated as
+ * stale by the budget guard, which pauses with an honest, run-naming reason once
+ * it does. This scans across every company — unlike `health()`, which is scoped
+ * to one — so an agent with no budget policy at all (nothing ever evaluates
+ * `observedBlocks` for it) doesn't silently accumulate unsettled runs with no
+ * signal anywhere. Deliberately read-only and NOT wired to any scheduler: that
+ * is an operational decision (poll cadence, alert channel — log, page,
+ * dashboard) for whoever owns this install's monitoring to make. */
+export async function findStaleAccountingPendingRuns(db: Db, olderThanMs: number, limit = 200): Promise<StaleAccountingPendingRun[]> {
+  const cutoff = new Date(Date.now() - olderThanMs);
+  const rows = await db.execute<{ companyId: string; runId: string; agentId: string; finishedAt: string }>(sql`
+    select company_id as "companyId", id as "runId", agent_id as "agentId", coalesce(finished_at, created_at)::text as "finishedAt"
+    from heartbeat_runs
+    where cost_accounting_pending and status in ('succeeded','failed','timed_out','cancelled','interrupted')
+      and coalesce(finished_at, created_at) < ${cutoff.toISOString()}::timestamptz
+    order by coalesce(finished_at, created_at)
+    limit ${limit}`);
+  const now = Date.now();
+  return rows.map(row => ({ ...row, ageMs: now - new Date(row.finishedAt).getTime() }));
+}
+
 export function accountingIntegrityService(db: Db, hooks: BudgetServiceHooks = {}) {
   return {
     inspect: (companyId: string) => withAccountingReadSnapshot(db, companyId, tx => inspect(tx, companyId)),
