@@ -196,6 +196,14 @@ function unpricedUsageBlocks(policy: PolicyRow, observed: ObservedSpend) {
  * See JEN-42. */
 export const ACCOUNTING_PENDING_GRACE_MS = 5 * 60 * 1000;
 
+/** A run that never produced a usage receipt cannot be settled no matter how long
+ * it is waited on — the provider process died mid-turn, the receipt spool lost it,
+ * or the capture failed. Past this age the debt stops blocking new work; the gap
+ * stays visible through accountingLastError and the integrity report, and a late
+ * receipt is still replayed when it arrives. Without an upper bound a single lost
+ * receipt paused an agent permanently (spend $0, pause_reason 'budget'). */
+export const ACCOUNTING_ABANDONED_MS = 10 * 60 * 1000;
+
 const STALE_PENDING_RUN_ID_SAMPLE = 5;
 
 type StalePendingRunInfo = { stalePendingRunCount: number; stalePendingRunIds: string[] };
@@ -230,7 +238,12 @@ async function computeStalePendingRunInfo(db: Db, policies: PolicyRow[], now = n
       policy.scopeType === "project" ? sql`${heartbeatRuns.usageJson}->'ledgerScope'->>'projectId' = ${policy.scopeId}` : undefined,
       inWindow,
     )!;
-    const stale = and(scoped, sql`coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.createdAt}) < ${staleCutoff.toISOString()}::timestamptz`)!;
+    const abandonedCutoff = new Date(now.getTime() - ACCOUNTING_ABANDONED_MS);
+    const stale = and(
+      scoped,
+      sql`coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.createdAt}) < ${staleCutoff.toISOString()}::timestamptz`,
+      sql`coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.createdAt}) >= ${abandonedCutoff.toISOString()}::timestamptz`,
+    )!;
     predicates.push(scoped);
     columns[`count${index}`] = sql`count(*) filter (where ${stale})::int`;
     columns[`ids${index}`] = sql`coalesce(array_agg(${heartbeatRuns.id}::text order by coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.createdAt}))
